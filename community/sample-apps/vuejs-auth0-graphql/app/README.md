@@ -21,13 +21,38 @@ Auth0 as our authentication and JWT token provider.
 
 ## Add rules for custom JWT claims
 
-In the Auth0 dashboard, navigate to "Rules". Add the following rules to add our custom JWT claims:
+Auth0 has multiple versions of its SDK available and unfortunately they have different semantics
+when it comes to JWT handling. If you're using [Auth0.js](https://auth0.com/docs/libraries/auth0js),
+you'll need to add a rule to update the `idToken`. If you're using the [Auth0 Single Page App SDK](https://auth0.com/docs/libraries/auth0-spa-js),
+you'll need to add a rule to update the `accessToken`. If you update the wrong token, the necessary
+Hasura claims will not appear in the generated JWT and your client will not authenticate properly.
+
+In both cases you'll want to open the Auth0 dashboard and then navigate to "Rules". Then add a rule
+to add the custom JWT claims. You can name the rule anything you want.
+
+For Auth0.js:
 
 ```javascript
 function (user, context, callback) {
   const namespace = "https://hasura.io/jwt/claims";
   context.idToken[namespace] = 
     { 
+      'x-hasura-default-role': 'user',
+      // do some custom logic to decide allowed roles
+      'x-hasura-allowed-roles': user.email === 'admin@foobar.com' ? ['user', 'admin'] : ['user'],
+      'x-hasura-user-id': user.user_id
+    };
+  callback(null, user, context);
+}
+```
+
+For auth0-spa-js:
+
+```javascript
+function (user, context, callback) {
+  const namespace = "https://hasura.io/jwt/claims";
+  context.accessToken[namespace] =
+    {
       'x-hasura-default-role': 'user',
       // do some custom logic to decide allowed roles
       'x-hasura-allowed-roles': user.email === 'admin@foobar.com' ? ['user', 'admin'] : ['user'],
@@ -77,7 +102,7 @@ To do this, open `auth_config.json`, and replace the values within with your own
 ```
 
 ## Create the initial tables
-1. Add your database URL and admin secret in `hasura/config.yaml`
+1. Add your graphql URL (like https://your-app.herokuapp.com) and admin secret in `hasura/config.yaml`
 
 ```yaml
 endpoint: https://<hge-heroku-url>
@@ -88,21 +113,44 @@ admin_secret: <your-admin-secret>
 
 ## Create Auth0 Rule
 
-Everytime user signups on Auth0, we need to sync that user into our postgres database. This is done using Auth0 rules. Create a Rule and insert the following code:
+Everytime a user signs up via Auth0, we need to sync that user into our postgres database. This is done using Auth0 rules.
+
+### Add an Auth0 rule configuration value
+Go to https://manage.auth0.com/dashboard/us/your-auth0-app/rules and add a configuration value to the `Settings` section.
+
+* Key: `x-hasura-admin-secret`
+* Value: your admin secret
+
+## Create the Auth0 rule
+Create a Rule and insert the following code:
 
 ```
 function (user, context, callback) {
-  const userId = user.user_id;
-  const nickname = user.nickname;
+  const mutation = `
+mutation ($id: String!, $email: String!) {
+  insert_user(objects: [{
+    id: $id,
+    email: $email
+  }]) {
+    affected_rows
+  }
+}`;
+
+  const variables = {
+    id: user.user_id,
+    email: user.email
+  };
   
+  const body = { query: mutation, variables };
+
   request.post({
-  headers: {'content-type' : 'application/json', 'x-hasura-admin-secret': '<your-admin-secret>'},
-  url:     'http://myapp.herokuapp.com/v1/graphql',
-  body:    `{\"query\":\"mutation($userId: String!, $nickname: String) {\\n          insert_users(\\n            objects: [{ auth0_id: $userId, name: $nickname }]\\n            on_conflict: {\\n              constraint: users_pkey\\n              update_columns: [last_seen, name]\\n            }\\n          ) {\\n            affected_rows\\n          }\\n        }\",\"variables\":{\"userId\":\"${userId}\",\"nickname\":\"${nickname}\"}}`
-}, function(error, response, body){
+    headers: {'content-type': 'application/json', 'x-hasura-admin-secret': configuration['x-hasura-admin-secret']},
+    url:     'https://your-app.herokuapp.com/v1/graphql',
+    body:    JSON.stringify(body)
+  }, function(error, response, body) {
     console.log(body);
-    callback(null, user, context);
-});
+    callback(error, user, context);
+  });
 }
 ```
 

@@ -9,7 +9,8 @@ module Hasura.RQL.DDL.Schema.Enum (
   , EnumValueInfo(..)
   , EnumValue(..)
 
-  -- * Loading enum values
+  -- * Loading table info
+  , resolveEnumReferences
   , fetchAndValidateEnumValues
   ) where
 
@@ -20,16 +21,40 @@ import           Data.List                     (delete)
 
 import qualified Data.HashMap.Strict           as M
 import qualified Data.List.NonEmpty            as NE
+import qualified Data.Sequence                 as Seq
+import qualified Data.Sequence.NonEmpty        as NESeq
 import qualified Data.Text                     as T
 import qualified Database.PG.Query             as Q
 import qualified Language.GraphQL.Draft.Syntax as G
 
 import           Hasura.Db
 import           Hasura.RQL.Types.Column
+import           Hasura.RQL.Types.Common
 import           Hasura.RQL.Types.Error
+import           Hasura.Server.Utils           (makeReasonMessage)
 import           Hasura.SQL.Types
 
 import qualified Hasura.SQL.DML                as S
+
+-- | Given a map of enum tables, computes all enum references implied by the given set of foreign
+-- keys. A foreign key constitutes an enum reference iff the following conditions hold:
+--
+--   1. The key only includes a single column.
+--   2. The referenced column is the table’s primary key.
+--   3. The referenced table is, in fact, an enum table.
+resolveEnumReferences
+  :: HashMap QualifiedTable (PrimaryKey PGCol, EnumValues)
+  -> HashSet ForeignKey
+  -> HashMap PGCol (NonEmpty EnumReference)
+resolveEnumReferences enumTables =
+  M.fromListWith (<>) . map (fmap (:|[])) . mapMaybe resolveEnumReference . toList
+  where
+    resolveEnumReference :: ForeignKey -> Maybe (PGCol, EnumReference)
+    resolveEnumReference foreignKey = do
+      [(localColumn, foreignColumn)] <- pure $ M.toList (_fkColumnMapping foreignKey)
+      (primaryKey, enumValues) <- M.lookup (_fkForeignTable foreignKey) enumTables
+      guard (_pkColumns primaryKey == foreignColumn NESeq.:<|| Seq.Empty)
+      pure (localColumn, EnumReference (_fkForeignTable foreignKey) enumValues)
 
 data EnumTableIntegrityError
   = EnumTableMissingPrimaryKey
@@ -44,26 +69,25 @@ data EnumTableIntegrityError
 fetchAndValidateEnumValues
   :: (MonadTx m)
   => QualifiedTable
-  -> [PGRawColumnInfo]
+  -> Maybe (PrimaryKey PGRawColumnInfo)
   -> [PGRawColumnInfo]
   -> m EnumValues
-fetchAndValidateEnumValues tableName primaryKeyColumns columnInfos =
+fetchAndValidateEnumValues tableName maybePrimaryKey columnInfos =
   either (throw400 ConstraintViolation . showErrors) pure =<< runValidateT fetchAndValidate
   where
     fetchAndValidate :: (MonadTx m, MonadValidate [EnumTableIntegrityError] m) => m EnumValues
     fetchAndValidate = do
-      maybePrimaryKey <- tolerate validatePrimaryKey
-      maybeCommentColumn <- validateColumns maybePrimaryKey
-      enumValues <- maybe (refute mempty) (fetchEnumValues maybeCommentColumn) maybePrimaryKey
-      validateEnumValues enumValues
-      pure enumValues
+      primaryKeyColumn <- tolerate validatePrimaryKey
+      maybeCommentColumn <- validateColumns primaryKeyColumn
+      maybe (refute mempty) (fetchEnumValues maybeCommentColumn) primaryKeyColumn
       where
-        validatePrimaryKey = case primaryKeyColumns of
-          [] -> refute [EnumTableMissingPrimaryKey]
-          [column] -> case prciType column of
-            PGText -> pure column
-            _      -> refute [EnumTableNonTextualPrimaryKey column]
-          _ -> refute [EnumTableMultiColumnPrimaryKey $ map prciName primaryKeyColumns]
+        validatePrimaryKey = case maybePrimaryKey of
+          Nothing -> refute [EnumTableMissingPrimaryKey]
+          Just primaryKey -> case _pkColumns primaryKey of
+            column NESeq.:<|| Seq.Empty -> case prciType column of
+              PGText -> pure column
+              _      -> refute [EnumTableNonTextualPrimaryKey column]
+            columns -> refute [EnumTableMultiColumnPrimaryKey $ map prciName (toList columns)]
 
         validateColumns primaryKeyColumn = do
           let nonPrimaryKeyColumns = maybe columnInfos (`delete` columnInfos) primaryKeyColumn
@@ -71,7 +95,7 @@ fetchAndValidateEnumValues tableName primaryKeyColumns columnInfos =
             [] -> pure Nothing
             [column] -> case prciType column of
               PGText -> pure $ Just column
-              _ -> dispute [EnumTableNonTextualCommentColumn column] $> Nothing
+              _      -> dispute [EnumTableNonTextualCommentColumn column] $> Nothing
             columns -> dispute [EnumTableTooManyColumns $ map prciName columns] $> Nothing
 
         fetchEnumValues maybeCommentColumn primaryKeyColumn = do
@@ -80,31 +104,29 @@ fetchAndValidateEnumValues tableName primaryKeyColumns columnInfos =
               query = Q.fromBuilder $ toSQL S.mkSelect
                 { S.selFrom = Just $ S.mkSimpleFromExp tableName
                 , S.selExtr = [S.mkExtr (prciName primaryKeyColumn), commentExtr] }
-          fmap mkEnumValues . liftTx $ Q.withQE defaultTxErrorHandler query () True
-
-        mkEnumValues rows = M.fromList . flip map rows $ \(key, comment) ->
-          (EnumValue key, EnumValueInfo comment)
-
-        validateEnumValues enumValues = do
-          let enumValueNames = map (G.Name . getEnumValue) (M.keys enumValues)
-          when (null enumValueNames) $
-            refute [EnumTableNoEnumValues]
-          let badNames = map G.unName $ filter (not . isValidEnumName) enumValueNames
-          for_ (NE.nonEmpty badNames) $ \someBadNames ->
-            refute [EnumTableInvalidEnumValueNames someBadNames]
+          rawEnumValues <- liftTx $ Q.withQE defaultTxErrorHandler query () True
+          when (null rawEnumValues) $ dispute [EnumTableNoEnumValues]
+          let enumValues = flip map rawEnumValues $
+                \(enumValueText, comment) ->
+                  case mkValidEnumValueName enumValueText of
+                    Nothing        -> Left enumValueText
+                    Just enumValue -> Right (EnumValue enumValue, EnumValueInfo comment)
+              badNames = lefts enumValues
+              validEnums = rights enumValues
+          case NE.nonEmpty badNames of
+            Just someBadNames -> refute [EnumTableInvalidEnumValueNames someBadNames]
+            Nothing           -> pure $ M.fromList validEnums
 
         -- https://graphql.github.io/graphql-spec/June2018/#EnumValue
-        isValidEnumName name =
-          G.isValidName name && name `notElem` ["true", "false", "null"]
+        mkValidEnumValueName name =
+          if name `elem` ["true", "false", "null"] then Nothing
+          else G.mkName name
 
     showErrors :: [EnumTableIntegrityError] -> T.Text
     showErrors allErrors =
       "the table " <> tableName <<> " cannot be used as an enum " <> reasonsMessage
       where
-        reasonsMessage = case allErrors of
-          [singleError] -> "because " <> showOne singleError
-          _ -> "for the following reasons:\n" <> T.unlines
-            (map (("  • " <>) . showOne) allErrors)
+        reasonsMessage = makeReasonMessage allErrors showOne
 
         showOne :: EnumTableIntegrityError -> T.Text
         showOne = \case

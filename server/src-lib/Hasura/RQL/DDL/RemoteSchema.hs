@@ -1,133 +1,113 @@
+{-# LANGUAGE ViewPatterns #-}
 module Hasura.RQL.DDL.RemoteSchema
   ( runAddRemoteSchema
   , runRemoveRemoteSchema
   , removeRemoteSchemaFromCatalog
   , runReloadRemoteSchema
-  , buildGCtxMap
   , fetchRemoteSchemas
   , addRemoteSchemaP1
   , addRemoteSchemaP2Setup
   , addRemoteSchemaP2
+  , runIntrospectRemoteSchema
+  , addRemoteSchemaToCatalog
   ) where
 
+import           Control.Monad.Unique
 import           Hasura.EncJSON
+-- import           Hasura.GraphQL.NormalForm
+import           Hasura.GraphQL.RemoteServer
+-- import           Hasura.GraphQL.Schema.Merge
 import           Hasura.Prelude
+import           Hasura.RQL.DDL.Deps
 
 import qualified Data.Aeson                  as J
 import qualified Data.HashMap.Strict         as Map
+import qualified Data.HashSet                as S
 import qualified Database.PG.Query           as Q
 
-import           Hasura.GraphQL.RemoteServer
 import           Hasura.RQL.Types
+import           Hasura.Server.Version             (HasVersion)
 import           Hasura.SQL.Types
 
-import qualified Hasura.GraphQL.Schema       as GS
+import qualified Data.Environment                  as Env
 
 runAddRemoteSchema
-  :: ( QErrM m, UserInfoM m
-     , CacheRWM m, MonadTx m
-     , MonadIO m, HasHttpManager m
+  :: ( HasVersion
+     , QErrM m
+     , CacheRWM m
+     , MonadTx m
+     , MonadIO m
+     , MonadUnique m
+     , HasHttpManager m
      )
-  => AddRemoteSchemaQuery -> m EncJSON
-runAddRemoteSchema q = do
-  addRemoteSchemaP1 name >> addRemoteSchemaP2 q
+  => Env.Environment
+  -> AddRemoteSchemaQuery
+  -> m EncJSON
+runAddRemoteSchema env q = do
+  addRemoteSchemaP1 name
+  addRemoteSchemaP2 env q
+  buildSchemaCacheFor $ MORemoteSchema name
+  pure successMsg
   where
     name = _arsqName q
 
 addRemoteSchemaP1
-  :: (QErrM m, UserInfoM m, CacheRM m)
+  :: (QErrM m, CacheRM m)
   => RemoteSchemaName -> m ()
 addRemoteSchemaP1 name = do
-  adminOnly
   remoteSchemaMap <- scRemoteSchemas <$> askSchemaCache
   onJust (Map.lookup name remoteSchemaMap) $ const $
     throw400 AlreadyExists $ "remote schema with name "
     <> name <<> " already exists"
 
 addRemoteSchemaP2Setup
-  :: (QErrM m, CacheRWM m, MonadIO m, HasHttpManager m)
-  => AddRemoteSchemaQuery -> m RemoteSchemaCtx
-addRemoteSchemaP2Setup q = do
+  :: (HasVersion, QErrM m, MonadIO m, MonadUnique m, HasHttpManager m)
+  => Env.Environment
+  -> AddRemoteSchemaQuery -> m RemoteSchemaCtx
+addRemoteSchemaP2Setup env (AddRemoteSchemaQuery name def _) = do
   httpMgr <- askHttpManager
-  rsi <- validateRemoteSchemaDef def
-  gCtx <- fetchRemoteSchema httpMgr name rsi
-  let rsCtx = RemoteSchemaCtx name gCtx rsi
-  addRemoteSchemaToCache rsCtx
-  return rsCtx
-  where
-    AddRemoteSchemaQuery name def _ = q
+  rsi <- validateRemoteSchemaDef env def
+  fetchRemoteSchema env httpMgr name rsi
 
 addRemoteSchemaP2
-  :: ( QErrM m
-     , CacheRWM m
-     , MonadTx m
-     , MonadIO m, HasHttpManager m
-     )
-  => AddRemoteSchemaQuery
-  -> m EncJSON
-addRemoteSchemaP2 q = do
-  void $ addRemoteSchemaP2Setup q
+  :: (HasVersion, MonadTx m, MonadIO m, MonadUnique m, HasHttpManager m) => Env.Environment -> AddRemoteSchemaQuery -> m ()
+addRemoteSchemaP2 env q = do
+  void $ addRemoteSchemaP2Setup env q
   liftTx $ addRemoteSchemaToCatalog q
-  return successMsg
 
 runRemoveRemoteSchema
   :: (QErrM m, UserInfoM m, CacheRWM m, MonadTx m)
   => RemoteSchemaNameQuery -> m EncJSON
-runRemoveRemoteSchema (RemoteSchemaNameQuery rsn)= do
+runRemoveRemoteSchema (RemoteSchemaNameQuery rsn) = do
   removeRemoteSchemaP1 rsn
-  removeRemoteSchemaP2 rsn
+  liftTx $ removeRemoteSchemaFromCatalog rsn
+  withNewInconsistentObjsCheck buildSchemaCache
+  pure successMsg
 
 removeRemoteSchemaP1
   :: (UserInfoM m, QErrM m, CacheRM m)
   => RemoteSchemaName -> m ()
 removeRemoteSchemaP1 rsn = do
-  adminOnly
   sc <- askSchemaCache
   let rmSchemas = scRemoteSchemas sc
   void $ onNothing (Map.lookup rsn rmSchemas) $
     throw400 NotExists "no such remote schema"
-
-removeRemoteSchemaP2
-  :: ( CacheRWM m
-     , MonadTx m
-     )
-  => RemoteSchemaName
-  -> m EncJSON
-removeRemoteSchemaP2 rsn = do
-  delRemoteSchemaFromCache rsn
-  liftTx $ removeRemoteSchemaFromCatalog rsn
-  return successMsg
+  let depObjs = getDependentObjs sc remoteSchemaDepId
+  when (depObjs /= []) $ reportDeps depObjs
+  where
+    remoteSchemaDepId = SORemoteSchema rsn
 
 runReloadRemoteSchema
-  :: ( QErrM m, UserInfoM m , CacheRWM m
-     , MonadIO m, HasHttpManager m
-     )
+  :: (QErrM m, CacheRWM m)
   => RemoteSchemaNameQuery -> m EncJSON
 runReloadRemoteSchema (RemoteSchemaNameQuery name) = do
-  adminOnly
-  rmSchemas <- scRemoteSchemas <$> askSchemaCache
-  rsi <- fmap rscInfo $ onNothing (Map.lookup name rmSchemas) $
-         throw400 NotExists $ "remote schema with name "
-         <> name <<> " does not exist"
-  httpMgr <- askHttpManager
-  gCtx <- fetchRemoteSchema httpMgr name rsi
-  delRemoteSchemaFromCache name
-  addRemoteSchemaToCache $ RemoteSchemaCtx name gCtx rsi
-  return successMsg
+  remoteSchemas <- getAllRemoteSchemas <$> askSchemaCache
+  unless (name `elem` remoteSchemas) $ throw400 NotExists $
+    "remote schema with name " <> name <<> " does not exist"
 
--- | build GraphQL schema
-buildGCtxMap
-  :: (QErrM m, CacheRWM m) => m ()
-buildGCtxMap = do
-  -- build GraphQL Context with Hasura schema
-  GS.buildGCtxMapPG
-  sc <- askSchemaCache
-  let gCtxMap = scGCtxMap sc
-  -- Stitch remote schemas
-  (mergedGCtxMap, defGCtx) <- mergeSchemas (scRemoteSchemas sc) gCtxMap
-  writeSchemaCache sc { scGCtxMap = mergedGCtxMap
-                      , scDefaultRemoteGCtx = defGCtx
-                      }
+  let invalidations = mempty { ciRemoteSchemas = S.singleton name }
+  withNewInconsistentObjsCheck $ buildSchemaCacheWithOptions CatalogUpdate invalidations
+  pure successMsg
 
 addRemoteSchemaToCatalog
   :: AddRemoteSchemaQuery
@@ -146,13 +126,24 @@ removeRemoteSchemaFromCatalog name =
       WHERE name = $1
   |] (Identity name) True
 
-
 fetchRemoteSchemas :: Q.TxE QErr [AddRemoteSchemaQuery]
 fetchRemoteSchemas =
   map fromRow <$> Q.listQE defaultTxErrorHandler
     [Q.sql|
      SELECT name, definition, comment
        FROM hdb_catalog.remote_schemas
+     ORDER BY name ASC
      |] () True
   where
-    fromRow (n, Q.AltJ def, comm) = AddRemoteSchemaQuery n def comm
+    fromRow (name, Q.AltJ def, comment) =
+      AddRemoteSchemaQuery name def comment
+
+runIntrospectRemoteSchema
+  :: (CacheRM m, QErrM m) => RemoteSchemaNameQuery -> m EncJSON
+runIntrospectRemoteSchema (RemoteSchemaNameQuery rsName) = do
+  sc <- askSchemaCache
+  (RemoteSchemaCtx _ _ _ introspectionByteString _) <-
+    onNothing (Map.lookup rsName (scRemoteSchemas sc)) $
+    throw400 NotExists $
+    "remote schema: " <> rsName <<> " not found"
+  pure $ encJFromLBS introspectionByteString

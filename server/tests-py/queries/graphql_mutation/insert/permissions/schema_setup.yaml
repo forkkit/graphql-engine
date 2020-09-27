@@ -27,11 +27,30 @@ args:
         author_id INTEGER REFERENCES author(id),
         is_published BOOLEAN,
         published_on TIMESTAMP
-      )
+      );
+
+      CREATE FUNCTION fetch_articles(search text, author_row author)
+      RETURNS SETOF article AS $$
+        SELECT *
+        FROM article
+        WHERE
+          ( title ilike ('%' || search || '%')
+            OR content ilike ('%' || search || '%')
+          ) AND author_id = author_row.id
+      $$ LANGUAGE sql STABLE;
+
 - type: track_table
   args:
     schema: public
     name: article
+
+- type: add_computed_field
+  args:
+    table: author
+    name: get_articles
+    definition:
+      function: fetch_articles
+      table_argument: author_row
 
 #Create resident table
 - type: run_sql
@@ -444,3 +463,99 @@ args:
           _where:
             id: X-Hasura-User-Id
             is_admin: true
+
+- type: create_update_permission
+  args:
+    table: user
+    role: backend_user
+    permission:
+      check: {}
+      filter: {}
+      columns: '*'
+
+- type: create_insert_permission
+  args:
+    table: user
+    role: backend_user
+    permission:
+      check: {}
+      columns: '*'
+      backend_only: true
+      set:
+        is_admin: true
+
+- type: create_insert_permission
+  args:
+    table: user
+    role: backend_user_2
+    permission:
+      check: {}
+      columns: '*'
+      backend_only: true
+      set:
+        is_admin: true
+
+- type: create_select_permission
+  args:
+    table: user
+    role: backend_user
+    permission:
+      columns: '*'
+      filter: {}
+
+- type: create_select_permission
+  args:
+    table: user
+    role: backend_user_2
+    permission:
+      columns: '*'
+      filter: {}
+
+- type: create_insert_permission
+  args:
+    table: user
+    role: user
+    permission:
+      check: {}
+      columns: '*'
+      backend_only: false
+      set:
+        is_admin: false
+
+- type: run_sql
+  args:
+    sql: |
+      create table leads (
+        id serial primary key,
+        name text not null,
+        added_by text not null
+      );
+
+- type: track_table
+  args:
+    schema: public
+    name: leads
+
+
+# a sales role can add a new lead without any check
+- type: create_insert_permission
+  args:
+    table: leads
+    role:  sales
+    permission:
+      columns: [id, name, added_by]
+      check: {}
+      set: {}
+
+# a sales role can only update the leads added by them
+- type: create_update_permission
+  args:
+    table: leads
+    role: sales
+    permission:
+      columns: [name]
+      filter:
+        added_by: "X-Hasura-User-Id"
+      check:
+        name:
+          _ne: ""

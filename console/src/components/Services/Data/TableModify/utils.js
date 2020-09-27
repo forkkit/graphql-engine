@@ -42,6 +42,13 @@ const getValidAlterOptions = (alterTypeOptions, colName) => {
   };
 };
 
+export const convertToArrayOptions = options => {
+  return options.map(opt => ({
+    value: opt.value + '[]',
+    label: opt.label + '[]',
+  }));
+};
+
 const fetchColumnCastsQuery = `
 SELECT ts.typname AS "Source Type",
        pg_catalog.format_type(castsource, NULL) AS "Source Info",
@@ -70,25 +77,27 @@ ORDER BY 1, 2;
 
 `;
 
-const getCreatePkSql = ({
-  schemaName,
-  tableName,
-  selectedPkColumns,
-  constraintName,
-}) => {
-  return `alter table "${schemaName}"."${tableName}"
-    add constraint "${constraintName}" 
-    primary key ( ${selectedPkColumns.map(pkc => `"${pkc}"`).join(', ')} );`;
+export const sanitiseRootFields = rootFields => {
+  const santisedRootFields = {};
+  Object.keys(rootFields).forEach(rootFieldType => {
+    let rootField = rootFields[rootFieldType];
+    if (rootField !== null) {
+      rootField = rootField.trim() || null;
+    }
+    santisedRootFields[rootFieldType] = rootField;
+  });
+  return santisedRootFields;
 };
 
-const getDropPkSql = ({ schemaName, tableName, constraintName }) => {
-  return `alter table "${schemaName}"."${tableName}" drop constraint "${constraintName}";`;
+export const sanitiseColumnNames = columnNames => {
+  const sanitised = {};
+  Object.keys(columnNames).forEach(c => {
+    const trimmedCustomName = columnNames[c] ? columnNames[c].trim() : null;
+    if (trimmedCustomName) {
+      sanitised[c] = trimmedCustomName;
+    }
+  });
+  return sanitised;
 };
 
-export {
-  convertArrayToJson,
-  getValidAlterOptions,
-  fetchColumnCastsQuery,
-  getCreatePkSql,
-  getDropPkSql,
-};
+export { convertArrayToJson, getValidAlterOptions, fetchColumnCastsQuery };

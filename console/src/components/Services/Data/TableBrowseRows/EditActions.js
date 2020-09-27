@@ -11,12 +11,19 @@ import {
   generateTableDef,
   getColumnType,
   getTableColumn,
+  getEnumColumnMappings,
+  arrayToPostgresArray,
 } from '../../../Common/utils/pgUtils';
+import { getEnumOptionsQuery } from '../../../Common/utils/v1QueryUtils';
+import { ARRAY } from '../utils';
+import { isStringArray } from '../../../Common/utils/jsUtils';
 
 const E_SET_EDITITEM = 'EditItem/E_SET_EDITITEM';
 const E_ONGOING_REQ = 'EditItem/E_ONGOING_REQ';
 const E_REQUEST_SUCCESS = 'EditItem/E_REQUEST_SUCCESS';
 const E_REQUEST_ERROR = 'EditItem/E_REQUEST_ERROR';
+const E_FETCH_ENUM_OPTIONS_SUCCESS = 'EditItem/E_FETCH_ENUM_SUCCESS';
+const E_FETCH_ENUM_OPTIONS_ERROR = 'EditItem/E_FETCH_ENUM_ERROR';
 const MODAL_CLOSE = 'EditItem/MODAL_CLOSE';
 const MODAL_OPEN = 'EditItem/MODAL_OPEN';
 
@@ -75,6 +82,14 @@ const editItem = (tableName, colValues) => {
               colValue +
               ' as a valid JSON object/array';
           }
+        } else if (colType === ARRAY && isStringArray(colValue)) {
+          try {
+            const arr = JSON.parse(colValue);
+            _setObject[colName] = arrayToPostgresArray(arr);
+          } catch {
+            errorMessage =
+              colName + ' :: could not read ' + colValue + ' as a valid array';
+          }
         } else {
           _setObject[colName] = colValue;
         }
@@ -124,6 +139,53 @@ const editItem = (tableName, colValues) => {
   };
 };
 
+const fetchEnumOptions = () => {
+  return (dispatch, getState) => {
+    const {
+      tables: { allSchemas, currentTable, currentSchema },
+    } = getState();
+
+    const requests = getEnumColumnMappings(
+      allSchemas,
+      currentTable,
+      currentSchema
+    );
+
+    if (!requests) return;
+
+    const options = {
+      method: 'POST',
+      credentials: globalCookiePolicy,
+      headers: dataHeaders(getState),
+    };
+    const url = Endpoints.query;
+
+    requests.forEach(request => {
+      const req = getEnumOptionsQuery(request, currentSchema);
+
+      return dispatch(
+        requestAction(url, {
+          ...options,
+          body: JSON.stringify(req),
+        })
+      ).then(
+        data =>
+          dispatch({
+            type: E_FETCH_ENUM_OPTIONS_SUCCESS,
+            data: {
+              columnName: request.columnName,
+              options: data.reduce(
+                (acc, d) => [...acc, ...Object.values(d)],
+                []
+              ),
+            },
+          }),
+        () => dispatch({ type: E_FETCH_ENUM_OPTIONS_ERROR })
+      );
+    });
+  };
+};
+
 /* ************ reducers *********************** */
 const editReducer = (tableName, state, action) => {
   switch (action.type) {
@@ -164,6 +226,16 @@ const editReducer = (tableName, state, action) => {
         lastError: 'server-failure',
         lastSuccess: null,
       };
+    case E_FETCH_ENUM_OPTIONS_SUCCESS:
+      return {
+        ...state,
+        enumOptions: {
+          ...state.enumOptions,
+          [action.data.columnName]: action.data.options,
+        },
+      };
+    case E_FETCH_ENUM_OPTIONS_ERROR:
+      return { ...state, enumOptions: null };
     case MODAL_OPEN:
       return { ...state, isModalOpen: true };
     case MODAL_CLOSE:
@@ -174,4 +246,11 @@ const editReducer = (tableName, state, action) => {
 };
 
 export default editReducer;
-export { editItem, modalOpen, modalClose, E_SET_EDITITEM, E_ONGOING_REQ };
+export {
+  editItem,
+  fetchEnumOptions,
+  modalOpen,
+  modalClose,
+  E_SET_EDITITEM,
+  E_ONGOING_REQ,
+};

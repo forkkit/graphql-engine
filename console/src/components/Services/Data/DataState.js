@@ -22,13 +22,18 @@ const defaultViewState = {
   manualTriggers: [],
   triggeredRow: -1,
   triggeredFunction: null,
+  estimatedCount: 0,
+  isCountEstimated: 0,
 };
 
 const defaultPermissionsState = {
   table: '',
   role: '',
   query: '',
-  custom_checked: false,
+  custom_checked: {
+    check: false,
+    filter: false,
+  },
   newRole: '',
   limitEnabled: true,
   bulkSelect: [],
@@ -36,30 +41,18 @@ const defaultPermissionsState = {
   isEditing: false,
 };
 
-const defaultPresetsState = {
-  insert: {
-    key: '',
-    value: '',
-  },
-  update: {
-    key: '',
-    value: '',
-  },
-};
 const defaultQueryPermissions = {
   insert: {
     check: {},
     allow_upsert: true,
+    backend_only: false,
     set: {},
     columns: [],
-    localPresets: [
-      {
-        ...defaultPresetsState.insert,
-      },
-    ],
   },
   select: {
     columns: [],
+    computed_fields: [],
+    backend_only: false,
     filter: {},
     limit: null,
     allow_aggregations: false,
@@ -67,14 +60,11 @@ const defaultQueryPermissions = {
   update: {
     columns: [],
     filter: {},
+    backend_only: false,
     set: {},
-    localPresets: [
-      {
-        ...defaultPresetsState.update,
-      },
-    ],
   },
   delete: {
+    backend_only: false,
     filter: {},
   },
 };
@@ -105,6 +95,7 @@ const defaultModifyState = {
       onUpdate: 'restrict',
     },
   ],
+  checkConstraintsModify: [],
   uniqueKeyModify: [[]],
   relAdd: {
     isActive: true,
@@ -126,6 +117,20 @@ const defaultModifyState = {
     colMappings: [{ column: '', refColumn: '' }],
     isToggled: false,
   },
+  remoteRelationships: {
+    remoteSchema: {},
+  },
+  rootFieldsEdit: {
+    select: '',
+    select_by_pk: '',
+    select_aggregate: '',
+    insert: '',
+    insert_one: '',
+    update: '',
+    update_by_pk: '',
+    delete: '',
+    delete_by_pk: '',
+  },
   permissionsState: { ...defaultPermissionsState },
   prevPermissionState: { ...defaultPermissionsState },
   ongoingRequest: false,
@@ -133,6 +138,7 @@ const defaultModifyState = {
   lastSuccess: null,
   viewDefinition: null,
   viewDefinitionError: null,
+  viewDefSql: '',
   tableCommentEdit: { enabled: false, editedValue: null },
   alterColumnOptions: [], // Store supported implicit column -> column casts
   alterColumnOptionsFetchErr: null,
@@ -161,6 +167,7 @@ const defaultState = {
     lastSuccess: null,
   },
   allSchemas: [],
+  allRoles: [],
   postgresFunctions: [],
   nonTrackablePostgresFunctions: [],
   trackedFunctions: [],
@@ -181,5 +188,4 @@ export {
   defaultModifyState,
   defaultPermissionsState,
   defaultQueryPermissions,
-  defaultPresetsState,
 };

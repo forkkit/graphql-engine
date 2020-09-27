@@ -1,11 +1,8 @@
 import PropTypes from 'prop-types';
 import React, { Component } from 'react';
 import TableHeader from '../TableCommon/TableHeader';
-import JsonInput from '../../../Common/CustomInputTypes/JsonInput';
-import TextInput from '../../../Common/CustomInputTypes/TextInput';
 import Button from '../../../Common/Button/Button';
-import ReloadEnumValuesButton from '../Common/ReusableComponents/ReloadEnumValuesButton';
-import { getPlaceholder, BOOLEAN, JSONB, JSONDTYPE, TEXT } from '../utils';
+import ReloadEnumValuesButton from '../Common/Components/ReloadEnumValuesButton';
 import { ordinalColSort } from '../utils';
 
 // import RichTextEditor from 'react-rte';
@@ -13,11 +10,18 @@ import { replace } from 'react-router-redux';
 import globals from '../../../../Globals';
 import { E_ONGOING_REQ, editItem } from './EditActions';
 import { findTable, generateTableDef } from '../../../Common/utils/pgUtils';
+import { getTableBrowseRoute } from '../../../Common/utils/routesUtils';
+import { fetchEnumOptions } from './EditActions';
+import { TableRow } from '../Common/Components/TableRow';
 
 class EditItem extends Component {
   constructor() {
     super();
     this.state = { insertedRows: 0, editorColumnMap: {}, currentColumn: null };
+  }
+
+  componentDidMount() {
+    this.props.dispatch(fetchEnumOptions());
   }
 
   render() {
@@ -27,19 +31,24 @@ class EditItem extends Component {
       schemas,
       oldItem,
       migrationMode,
+      readOnlyMode,
       ongoingRequest,
       lastError,
       lastSuccess,
       count,
       dispatch,
+      enumOptions,
     } = this.props;
 
     // check if item exists
     if (!oldItem) {
       dispatch(
         replace(
-          `${globals.urlPrefix ||
-            ''}/data/schema/${currentSchema}/tables/${tableName}/browse`
+          `${globals.urlPrefix || ''}${getTableBrowseRoute(
+            currentSchema,
+            tableName,
+            true
+          )}`
         )
       );
       return null;
@@ -57,140 +66,26 @@ class EditItem extends Component {
     const refs = {};
 
     const elements = columns.map((col, i) => {
-      const colName = col.column_name;
-      const colType = col.data_type;
-      const hasDefault = col.column_default && col.column_default.trim() !== '';
-      const isNullable = col.is_nullable && col.is_nullable !== 'NO';
-      const isIdentity = col.is_identity && col.is_identity !== 'NO';
+      const { column_name: colName } = col;
 
       const prevValue = oldItem[colName];
 
       refs[colName] = {
+        insertRadioNode: null,
         valueNode: null,
-        valueInput: null,
         nullNode: null,
         defaultNode: null,
       };
-      const inputRef = node => (refs[colName].valueInput = node);
-
-      const clicker = e => {
-        e.target
-          .closest('.radio-inline')
-          .querySelector('input[type="radio"]').checked = true;
-        e.target.focus();
-      };
-
-      const standardEditProps = {
-        className: `form-control ${styles.insertBox}`,
-        'data-test': `typed-input-${i}`,
-        defaultValue: prevValue,
-        ref: inputRef,
-        type: 'text',
-        onClick: clicker,
-      };
-
-      const placeHolder = hasDefault
-        ? col.column_default
-        : getPlaceholder(colType);
-
-      let typedInput = (
-        <input {...standardEditProps} placeholder={placeHolder} />
-      );
-
-      if (typeof prevValue === 'object') {
-        typedInput = (
-          <JsonInput
-            standardProps={{
-              ...standardEditProps,
-              defaultValue: JSON.stringify(prevValue),
-            }}
-            placeholderProp={getPlaceholder(colType)}
-          />
-        );
-      }
-
-      switch (colType) {
-        case JSONB:
-        case JSONDTYPE:
-          typedInput = (
-            <JsonInput
-              standardProps={{
-                ...standardEditProps,
-                defaultValue: JSON.stringify(prevValue),
-              }}
-              placeholderProp={getPlaceholder(colType)}
-            />
-          );
-          break;
-        case TEXT:
-          typedInput = (
-            <TextInput
-              standardProps={{ ...standardEditProps }}
-              placeholderProp={getPlaceholder(colType)}
-            />
-          );
-          break;
-        case BOOLEAN:
-          typedInput = (
-            <select {...standardEditProps}>
-              <option value="" disabled>
-                -- bool --
-              </option>
-              <option value="true">True</option>
-              <option value="false">False</option>
-            </select>
-          );
-          break;
-        default:
-          break;
-      }
 
       return (
-        <div key={i} className="form-group">
-          <label
-            className={'col-sm-3 control-label ' + styles.insertBoxLabel}
-            title={colName}
-          >
-            {colName}
-          </label>
-          <label className={styles.radioLabel + ' radio-inline'}>
-            <input
-              type="radio"
-              ref={node => {
-                refs[colName].valueNode = node;
-              }}
-              name={colName + '-value'}
-              value="option1"
-            />
-            {typedInput}
-          </label>
-          <label className={styles.radioLabel + ' radio-inline'}>
-            <input
-              type="radio"
-              ref={node => {
-                refs[colName].nullNode = node;
-              }}
-              disabled={!isNullable}
-              name={colName + '-value'}
-              value="NULL"
-              defaultChecked={prevValue === null}
-            />
-            <span className={styles.radioSpan}>NULL</span>
-          </label>
-          <label className={styles.radioLabel + ' radio-inline'}>
-            <input
-              type="radio"
-              ref={node => {
-                refs[colName].defaultNode = node;
-              }}
-              name={colName + '-value'}
-              value="option3"
-              disabled={!hasDefault && !isIdentity}
-              defaultChecked={isIdentity}
-            />
-            <span className={styles.radioSpan}>Default</span>
-          </label>
-        </div>
+        <TableRow
+          key={i}
+          column={col}
+          setRef={(key, node) => (refs[colName][key] = node)}
+          enumOptions={enumOptions}
+          index={i}
+          prevValue={prevValue}
+        />
       );
     });
 
@@ -228,11 +123,11 @@ class EditItem extends Component {
         } else if (refs[colName].defaultNode.checked) {
           // default
           inputValues[colName] = { default: true };
-        } else if (refs[colName].valueNode.checked) {
+        } else if (refs[colName].insertRadioNode.checked) {
           inputValues[colName] =
-            refs[colName].valueInput.props !== undefined
-              ? refs[colName].valueInput.props.value
-              : refs[colName].valueInput.value;
+            refs[colName].valueNode.props !== undefined
+              ? refs[colName].valueNode.props.value
+              : refs[colName].valueNode.value;
         }
       });
 
@@ -249,6 +144,7 @@ class EditItem extends Component {
           table={currentTable}
           tabName="edit"
           migrationMode={migrationMode}
+          readOnlyMode={readOnlyMode}
         />
         <br />
         <div className={styles.insertContainer + ' container-fluid'}>
@@ -288,8 +184,10 @@ EditItem.propTypes = {
   lastSuccess: PropTypes.object,
   lastError: PropTypes.object,
   migrationMode: PropTypes.bool.isRequired,
+  readOnlyMode: PropTypes.bool.isRequired,
   count: PropTypes.number,
   dispatch: PropTypes.func.isRequired,
+  enumOptions: PropTypes.object,
 };
 
 const mapStateToProps = (state, ownProps) => {
@@ -298,6 +196,7 @@ const mapStateToProps = (state, ownProps) => {
     ...state.tables.update,
     schemas: state.tables.allSchemas,
     migrationMode: state.main.migrationMode,
+    readOnlyMode: state.main.readOnlyMode,
     currentSchema: state.tables.currentSchema,
   };
 };

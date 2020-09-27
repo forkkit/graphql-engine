@@ -6,6 +6,7 @@ module Hasura.RQL.DDL.ComputedField
   , ComputedFieldDefinition(..)
   , runAddComputedField
   , addComputedFieldP2Setup
+  , addComputedFieldToCatalog
   , DropComputedField
   , dropComputedFieldFromCatalog
   , runDropComputedField
@@ -14,12 +15,12 @@ module Hasura.RQL.DDL.ComputedField
 import           Hasura.Prelude
 
 import           Hasura.EncJSON
+import           Hasura.Incremental                 (Cacheable)
 import           Hasura.RQL.DDL.Deps
 import           Hasura.RQL.DDL.Permission.Internal
-import           Hasura.RQL.DDL.Schema.Function     (RawFunctionInfo (..),
-                                                     fetchRawFunctioInfo,
-                                                     mkFunctionArgs)
+import           Hasura.RQL.DDL.Schema.Function     (RawFunctionInfo (..), mkFunctionArgs)
 import           Hasura.RQL.Types
+import           Hasura.Server.Utils                (makeReasonMessage)
 import           Hasura.SQL.Types
 
 import           Data.Aeson
@@ -28,17 +29,20 @@ import           Data.Aeson.TH
 import           Language.Haskell.TH.Syntax         (Lift)
 
 import qualified Control.Monad.Validate             as MV
+import qualified Data.HashSet                       as S
 import qualified Data.Sequence                      as Seq
-import qualified Data.Text                          as T
 import qualified Database.PG.Query                  as Q
 import qualified Language.GraphQL.Draft.Syntax      as G
 
 data ComputedFieldDefinition
   = ComputedFieldDefinition
-  { _cfdFunction      :: !QualifiedFunction
-  , _cfdTableArgument :: !(Maybe FunctionArgName)
-  } deriving (Show, Eq, Lift)
-$(deriveJSON (aesonDrop 4 snakeCase) ''ComputedFieldDefinition)
+  { _cfdFunction        :: !QualifiedFunction
+  , _cfdTableArgument   :: !(Maybe FunctionArgName)
+  , _cfdSessionArgument :: !(Maybe FunctionArgName)
+  } deriving (Show, Eq, Lift, Generic)
+instance NFData ComputedFieldDefinition
+instance Cacheable ComputedFieldDefinition
+$(deriveJSON (aesonDrop 4 snakeCase){omitNothingFields = True} ''ComputedFieldDefinition)
 
 data AddComputedField
   = AddComputedField
@@ -46,42 +50,22 @@ data AddComputedField
   , _afcName       :: !ComputedFieldName
   , _afcDefinition :: !ComputedFieldDefinition
   , _afcComment    :: !(Maybe Text)
-  } deriving (Show, Eq, Lift)
+  } deriving (Show, Eq, Lift, Generic)
+instance NFData AddComputedField
+instance Cacheable AddComputedField
 $(deriveJSON (aesonDrop 4 snakeCase) ''AddComputedField)
 
-runAddComputedField
-  :: (QErrM m, CacheRWM m, MonadTx m , UserInfoM m)
-  => AddComputedField -> m EncJSON
+runAddComputedField :: (MonadTx m, CacheRWM m) => AddComputedField -> m EncJSON
 runAddComputedField q = do
-  addComputedFieldP1 q
-  addComputedFieldP2 q
-
-addComputedFieldP1
-  :: (UserInfoM m, QErrM m, CacheRM m)
-  => AddComputedField -> m ()
-addComputedFieldP1 q = do
-  adminOnly
-  tableInfo <- withPathK "table" $ askTabInfo tableName
-  withPathK "name" $ checkForFieldConflict tableInfo $
-    fromComputedField computedFieldName
-  where
-    AddComputedField tableName computedFieldName _ _ = q
-
-addComputedFieldP2
-  :: (QErrM m, CacheRWM m, MonadTx m)
-  => AddComputedField -> m EncJSON
-addComputedFieldP2 q = withPathK "definition" $ do
-  rawFunctionInfo <- withPathK "function" $
-    fetchRawFunctioInfo $ _cfdFunction definition
-  addComputedFieldP2Setup table computedField definition rawFunctionInfo comment
+  withPathK "table" $ askTabInfo (_afcTable q)
   addComputedFieldToCatalog q
-  return successMsg
-  where
-    AddComputedField table computedField definition comment = q
+  buildSchemaCacheFor $ MOTableObj (_afcTable q) (MTOComputedField $ _afcName q)
+  pure successMsg
 
 data ComputedFieldValidateError
   = CFVENotValidGraphQLName !ComputedFieldName
   | CFVEInvalidTableArgument !InvalidTableArgument
+  | CFVEInvalidSessionArgument !InvalidSessionArgument
   | CFVENotBaseReturnType !PGScalarType
   | CFVEReturnTableNotFound !QualifiedTable
   | CFVENoInputArguments
@@ -94,17 +78,26 @@ data InvalidTableArgument
   | ITANotTable !QualifiedTable !FunctionTableArgument
   deriving (Show, Eq)
 
+data InvalidSessionArgument
+  = ISANotFound !FunctionArgName
+  | ISANotJSON !FunctionSessionArgument
+  deriving (Show, Eq)
+
 showError :: QualifiedFunction -> ComputedFieldValidateError -> Text
 showError qf = \case
   CFVENotValidGraphQLName computedField ->
     computedField <<> " is not valid GraphQL name"
   CFVEInvalidTableArgument (ITANotFound argName) ->
-    argName <<> " is not an input argument of " <> qf <<> " function"
+    argName <<> " is not an input argument of the function " <>> qf
   CFVEInvalidTableArgument (ITANotComposite functionArg) ->
     showFunctionTableArgument functionArg <> " is not COMPOSITE type"
   CFVEInvalidTableArgument (ITANotTable ty functionArg) ->
     showFunctionTableArgument functionArg <> " of type " <> ty
     <<> " is not the table to which the computed field is being added"
+  CFVEInvalidSessionArgument (ISANotFound argName) ->
+    argName <<> " is not an input argument of the function " <>> qf
+  CFVEInvalidSessionArgument (ISANotJSON functionArg) ->
+    showFunctionSessionArgument functionArg <> " is not of type JSON"
   CFVENotBaseReturnType scalarType ->
     "the function " <> qf <<> " returning type " <> toSQLTxt scalarType
     <> " is not a BASE type"
@@ -119,34 +112,35 @@ showError qf = \case
     showFunctionTableArgument = \case
       FTAFirst          -> "first argument of the function " <>> qf
       FTANamed argName _ -> argName <<> " argument of the function " <>> qf
+    showFunctionSessionArgument = \case
+      FunctionSessionArgument argName _ -> argName <<> " argument of the function " <>> qf
 
 addComputedFieldP2Setup
-  :: (QErrM m, CacheRWM m)
-  => QualifiedTable
+  :: (QErrM m)
+  => S.HashSet QualifiedTable
+  -- ^ the set of all tracked tables
+  -> QualifiedTable
   -> ComputedFieldName
   -> ComputedFieldDefinition
   -> RawFunctionInfo
   -> Maybe Text
-  -> m ()
-addComputedFieldP2Setup table computedField definition rawFunctionInfo comment = do
-  sc <- askSchemaCache
-  computedFieldInfo <- either (throw400 NotSupported . showErrors) pure
-                        =<< MV.runValidateT (mkComputedFieldInfo sc)
-  addComputedFieldToCache table computedFieldInfo
+  -> m ComputedFieldInfo
+addComputedFieldP2Setup trackedTables table computedField definition rawFunctionInfo comment =
+  either (throw400 NotSupported . showErrors) pure =<< MV.runValidateT (mkComputedFieldInfo)
   where
     inputArgNames = rfiInputArgNames rawFunctionInfo
-    ComputedFieldDefinition function maybeTableArg = definition
+    ComputedFieldDefinition function maybeTableArg maybeSessionArg = definition
     functionReturnType = QualifiedPGType (rfiReturnTypeSchema rawFunctionInfo)
                          (rfiReturnTypeName rawFunctionInfo)
                          (rfiReturnTypeType rawFunctionInfo)
 
-    computedFieldGraphQLName = G.Name $ computedFieldNameToText computedField
+    computedFieldGraphQLName = G.mkName $ computedFieldNameToText computedField
 
     mkComputedFieldInfo :: (MV.MonadValidate [ComputedFieldValidateError] m)
-                          => SchemaCache -> m ComputedFieldInfo
-    mkComputedFieldInfo sc = do
+                          => m ComputedFieldInfo
+    mkComputedFieldInfo = do
       -- Check if computed field name is a valid GraphQL name
-      unless (G.isValidName computedFieldGraphQLName) $
+      unless (isJust computedFieldGraphQLName) $
         MV.dispute $ pure $ CFVENotValidGraphQLName computedField
 
       -- Check if function is VOLATILE
@@ -157,7 +151,7 @@ addComputedFieldP2Setup table computedField definition rawFunctionInfo comment =
       returnType <-
         if rfiReturnsTable rawFunctionInfo then do
           let returnTable = typeToTable functionReturnType
-          unless (isTableTracked sc returnTable) $ MV.dispute $ pure $
+          unless (returnTable `S.member` trackedTables) $ MV.dispute $ pure $
             CFVEReturnTableNotFound returnTable
           pure $ CFRSetofTable returnTable
         else do
@@ -185,9 +179,21 @@ addComputedFieldP2Setup table computedField definition rawFunctionInfo comment =
               validateTableArgumentType FTAFirst $ faType firstArg
           pure FTAFirst
 
+      maybePGSessionArg <- sequence $ do
+          argName <- maybeSessionArg
+          return $ case findWithIndex (maybe False (argName ==) . faName) inputArgs of
+            Just (sessionArg, index) -> do
+              let functionSessionArg = FunctionSessionArgument argName index
+              validateSessionArgumentType functionSessionArg $ faType sessionArg
+              pure functionSessionArg
+            Nothing ->
+              MV.refute $ pure $ CFVEInvalidSessionArgument $ ISANotFound argName
 
-      let computedFieldFunction =
-            ComputedFieldFunction function (Seq.fromList inputArgs) tableArgument $
+
+      let inputArgSeq = Seq.fromList $ dropTableAndSessionArgument tableArgument
+                        maybePGSessionArg inputArgs
+          computedFieldFunction =
+            ComputedFieldFunction function inputArgSeq tableArgument maybePGSessionArg $
             rfiDescription rawFunctionInfo
 
       pure $ ComputedFieldInfo computedField computedFieldFunction returnType comment
@@ -203,15 +209,35 @@ addComputedFieldP2Setup table computedField definition rawFunctionInfo comment =
       unless (table == typeTable) $
         MV.dispute $ pure $ CFVEInvalidTableArgument $ ITANotTable typeTable tableArg
 
+    validateSessionArgumentType :: (MV.MonadValidate [ComputedFieldValidateError] m)
+                                => FunctionSessionArgument
+                                -> QualifiedPGType
+                                -> m ()
+    validateSessionArgumentType sessionArg qpt = do
+      when (not . isJSONType . _qptName $ qpt) $
+        MV.dispute $ pure $ CFVEInvalidSessionArgument $ ISANotJSON sessionArg
+
     showErrors :: [ComputedFieldValidateError] -> Text
     showErrors allErrors =
       "the computed field " <> computedField <<> " cannot be added to table "
-      <> table <<> reasonMessage
+      <> table <<> " " <> reasonMessage
       where
-        reasonMessage = case allErrors of
-          [singleError] -> " because " <> showError function singleError
-          _ -> " for the following reasons: \n" <> T.unlines
-               (map (("  • " <>) . showError function) allErrors)
+        reasonMessage = makeReasonMessage allErrors (showError function)
+
+    dropTableAndSessionArgument :: FunctionTableArgument
+                                -> Maybe FunctionSessionArgument -> [FunctionArg]
+                                -> [FunctionArg]
+    dropTableAndSessionArgument tableArg sessionArg inputArgs =
+      let withoutTable = case tableArg of
+            FTAFirst  -> tail inputArgs
+            FTANamed argName _ ->
+              filter ((/=) (Just argName) . faName) inputArgs
+          alsoWithoutSession = case sessionArg of
+            Nothing -> withoutTable
+            Just (FunctionSessionArgument name _) ->
+              filter ((/=) (Just name) . faName) withoutTable
+      in alsoWithoutSession
+
 
 addComputedFieldToCatalog
   :: MonadTx m
@@ -243,28 +269,27 @@ instance FromJSON DropComputedField where
       <*> o .:? "cascade" .!= False
 
 runDropComputedField
-  :: (UserInfoM m, CacheRWM m, MonadTx m)
+  :: (MonadTx m, CacheRWM m)
   => DropComputedField -> m EncJSON
 runDropComputedField (DropComputedField table computedField cascade) = do
   -- Validation
-  adminOnly
-  fields <- withPathK "table" $ _tiFieldInfoMap <$> askTabInfo table
+  fields <- withPathK "table" $ _tciFieldInfoMap <$> askTableCoreInfo table
   void $ withPathK "name" $ askComputedFieldInfo fields computedField
 
   -- Dependencies check
   sc <- askSchemaCache
   let deps = getDependentObjs sc $ SOTableObj table $ TOComputedField computedField
   when (not cascade && not (null deps)) $ reportDeps deps
-  mapM_ purgeComputedFieldDependency deps
 
-  deleteComputedFieldFromCache table computedField
-  dropComputedFieldFromCatalog table computedField
+  withNewInconsistentObjsCheck do
+    mapM_ purgeComputedFieldDependency deps
+    dropComputedFieldFromCatalog table computedField
+    buildSchemaCache
   pure successMsg
   where
     purgeComputedFieldDependency = \case
-      SOTableObj qt (TOPerm role permType) | qt == table -> do
-        liftTx $ dropPermFromCatalog qt role permType
-        withPermType permType delPermFromCache role qt
+      SOTableObj qt (TOPerm roleName permType) | qt == table ->
+        liftTx $ dropPermFromCatalog qt roleName permType
       d -> throw500 $ "unexpected dependency for computed field "
            <> computedField <<> "; " <> reportSchemaObj d
 

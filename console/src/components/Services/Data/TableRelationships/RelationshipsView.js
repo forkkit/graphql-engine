@@ -1,24 +1,27 @@
 import React, { Component } from 'react';
 import PropTypes from 'prop-types';
 import TableHeader from '../TableCommon/TableHeader';
-import { RESET } from '../TableModify/ModifyActions';
 import { findAllFromRel } from '../utils';
 import { getObjArrRelList } from './utils';
 import { setTable, UPDATE_REMOTE_SCHEMA_MANUAL_REL } from '../DataActions';
 import AddManualRelationship from './AddManualRelationship';
 import RelationshipEditor from './RelationshipEditor';
 import { NotFoundError } from '../../../Error/PageNotFound';
+import RemoteRelationships from './RemoteRelationships/RemoteRelationships';
+import { fetchRemoteSchemas } from '../../RemoteSchema/Actions';
+import ToolTip from '../../../Common/Tooltip/Tooltip';
+import KnowMoreLink from '../../../Common/KnowMoreLink/KnowMoreLink';
 
 class RelationshipsView extends Component {
   componentDidMount() {
     const { dispatch, currentSchema, tableName } = this.props;
-    dispatch({ type: RESET });
     dispatch(setTable(tableName));
     // Sourcing the current schema into manual relationship
     dispatch({
       type: UPDATE_REMOTE_SCHEMA_MANUAL_REL,
       data: currentSchema,
     });
+    dispatch(fetchRemoteSchemas());
   }
 
   render() {
@@ -33,8 +36,11 @@ class RelationshipsView extends Component {
       manualRelAdd,
       currentSchema,
       migrationMode,
+      readOnlyMode,
       schemaList,
+      remoteSchemas,
     } = this.props;
+
     const styles = require('../TableModify/ModifyTable.scss');
     const tableStyles = require('../../../Common/TableCommon/TableStyles.scss');
 
@@ -81,9 +87,7 @@ class RelationshipsView extends Component {
       addedRelationshipsView = (
         <div className={tableStyles.tableContainer}>
           <table
-            className={`${
-              tableStyles.table
-            } table table-bordered table-striped table-hover`}
+            className={`${tableStyles.table} table table-bordered table-striped table-hover`}
           >
             <thead>
               <tr>
@@ -133,6 +137,19 @@ class RelationshipsView extends Component {
       );
     }
 
+    const remoteRelationshipsSection = () => {
+      return (
+        <div className={`${styles.padd_left_remove} col-xs-10 col-md-10`}>
+          <RemoteRelationships
+            relationships={tableSchema.remote_relationships}
+            reduxDispatch={dispatch}
+            table={tableSchema}
+            remoteSchemas={remoteSchemas}
+          />
+        </div>
+      );
+    };
+
     return (
       <div className={`${styles.container} container-fluid`}>
         <TableHeader
@@ -140,22 +157,31 @@ class RelationshipsView extends Component {
           table={tableSchema}
           tabName="relationships"
           migrationMode={migrationMode}
+          readOnlyMode={readOnlyMode}
         />
         <br />
         <div className={`${styles.padd_left_remove} container-fluid`}>
-          <div className={`${styles.padd_left_remove} col-xs-10 col-md-10`}>
-            <h4 className={styles.subheading_text}>Relationships</h4>
+          <div
+            className={`${styles.padd_left_remove} ${styles.add_mar_bottom} col-xs-10 col-md-10`}
+          >
+            <h4 className={styles.subheading_text}>
+              Table Relationships
+              <ToolTip message={'Relationships to tables / views'} />
+              &nbsp;
+              <KnowMoreLink href="https://hasura.io/docs/1.0/graphql/manual/schema/table-relationships/index.html" />
+            </h4>
             {addedRelationshipsView}
-            <br />
-            <AddManualRelationship
-              tableSchema={tableSchema}
-              allSchemas={allSchemas}
-              schemaList={schemaList}
-              relAdd={manualRelAdd}
-              dispatch={dispatch}
-            />
-            <hr />
+            <div className={styles.activeEdit}>
+              <AddManualRelationship
+                tableSchema={tableSchema}
+                allSchemas={allSchemas}
+                schemaList={schemaList}
+                relAdd={manualRelAdd}
+                dispatch={dispatch}
+              />
+            </div>
           </div>
+          {remoteRelationshipsSection()}
         </div>
         <div className={`${styles.fixed} hidden`}>{alert}</div>
       </div>
@@ -170,11 +196,15 @@ RelationshipsView.propTypes = {
   activeEdit: PropTypes.object.isRequired,
   manualRelAdd: PropTypes.object.isRequired,
   ongoingRequest: PropTypes.bool.isRequired,
+  migrationMode: PropTypes.bool.isRequired,
+  readOnlyMode: PropTypes.bool.isRequired,
   lastError: PropTypes.object,
   lastFormError: PropTypes.object,
   lastSuccess: PropTypes.bool,
   dispatch: PropTypes.func.isRequired,
   serverVersion: PropTypes.string,
+  remoteSchemas: PropTypes.array.isRequired,
+  featuresCompatibility: PropTypes.object,
 };
 
 const mapStateToProps = (state, ownProps) => ({
@@ -182,8 +212,10 @@ const mapStateToProps = (state, ownProps) => ({
   allSchemas: state.tables.allSchemas,
   currentSchema: state.tables.currentSchema,
   migrationMode: state.main.migrationMode,
+  readOnlyMode: state.main.readOnlyMode,
   serverVersion: state.main.serverVersion,
   schemaList: state.tables.schemaList,
+  remoteSchemas: state.remoteSchemas.listData.remoteSchemas.map(r => r.name),
   ...state.tables.modify,
 });
 

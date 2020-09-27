@@ -7,18 +7,21 @@ import Tooltip from 'react-bootstrap/lib/Tooltip';
 import * as tooltips from './Tooltips';
 import globals from '../../Globals';
 import { getPathRoot } from '../Common/utils/urlUtils';
-
 import Spinner from '../Common/Spinner/Spinner';
 import WarningSymbol from '../Common/WarningSymbol/WarningSymbol';
+import logo from './images/white-logo.svg';
+import pixHeart from './images/pix-heart.svg';
+
+import styles from './Main.scss';
 
 import {
   loadServerVersion,
   fetchServerConfig,
   loadLatestServerVersion,
   featureCompatibilityInit,
+  emitProClickedEvent,
+  fetchPostgresVersion,
 } from './Actions';
-
-import { loadConsoleTelemetryOpts } from '../../telemetry/Actions.js';
 
 import {
   loadInconsistentObjects,
@@ -28,17 +31,31 @@ import {
 import {
   getLoveConsentState,
   setLoveConsentState,
-} from './loveConsentLocalStorage';
+  getProClickState,
+  setProClickState,
+} from './utils';
 
-import { versionGT, FT_JWT_ANALYZER } from '../../helpers/versionUtils';
+import { checkStableVersion, versionGT } from '../../helpers/versionUtils';
+import { getSchemaBaseRoute } from '../Common/utils/routesUtils';
+import {
+  getLocalStorageItem,
+  LS_VERSION_UPDATE_CHECK_LAST_CLOSED,
+  setLocalStorageItem,
+} from '../Common/utils/localStorageUtils';
+import ToolTip from '../Common/Tooltip/Tooltip';
+import { setPreReleaseNotificationOptOutInDB } from '../../telemetry/Actions';
+import { Icon } from '../UIKit/atoms/Icon';
+import { Help, ProPopup } from './components/';
 
 class Main extends React.Component {
   constructor(props) {
     super(props);
 
     this.state = {
-      showUpdateNotification: false,
+      updateNotificationVersion: null,
       loveConsentState: getLoveConsentState(),
+      proClickState: getProClickState(),
+      isPopUpOpen: false,
     };
 
     this.handleBodyClick = this.handleBodyClick.bind(this);
@@ -54,60 +71,69 @@ class Main extends React.Component {
     dispatch(loadServerVersion()).then(() => {
       dispatch(featureCompatibilityInit());
 
-      dispatch(loadInconsistentObjects()).then(() => {
-        this.handleMetadataRedirect();
-      });
-
-      dispatch(loadConsoleTelemetryOpts());
+      dispatch(loadInconsistentObjects({ shouldReloadMetadata: false })).then(
+        () => {
+          this.handleMetadataRedirect();
+        }
+      );
 
       dispatch(loadLatestServerVersion()).then(() => {
         this.setShowUpdateNotification();
       });
     });
+
+    dispatch(fetchPostgresVersion);
+
+    dispatch(fetchServerConfig);
   }
 
-  componentWillReceiveProps(nextProps) {
-    const {
-      [FT_JWT_ANALYZER]: currJwtAnalyzerCompatibility,
-    } = this.props.featuresCompatibility;
-    const {
-      [FT_JWT_ANALYZER]: nextJwtAnalyzerCompatibility,
-    } = nextProps.featuresCompatibility;
-
-    if (
-      currJwtAnalyzerCompatibility !== nextJwtAnalyzerCompatibility &&
-      nextJwtAnalyzerCompatibility
-    ) {
-      this.fetchServerConfig();
-    }
-  }
+  toggleProPopup = () => {
+    const { dispatch } = this.props;
+    dispatch(emitProClickedEvent({ open: !this.state.isPopUpOpen }));
+    this.setState({ isPopUpOpen: !this.state.isPopUpOpen });
+  };
 
   setShowUpdateNotification() {
-    const { latestServerVersion, serverVersion } = this.props;
+    const {
+      latestStableServerVersion,
+      latestPreReleaseServerVersion,
+      serverVersion,
+      console_opts,
+    } = this.props;
+
+    const allowPreReleaseNotifications =
+      !console_opts || !console_opts.disablePreReleaseUpdateNotifications;
+
+    let latestServerVersionToCheck;
+    if (
+      allowPreReleaseNotifications &&
+      versionGT(latestPreReleaseServerVersion, latestStableServerVersion)
+    ) {
+      latestServerVersionToCheck = latestPreReleaseServerVersion;
+    } else {
+      latestServerVersionToCheck = latestStableServerVersion;
+    }
 
     try {
-      const isClosedBefore = window.localStorage.getItem(
-        latestServerVersion + '_BANNER_NOTIFICATION_CLOSED'
+      const lastUpdateCheckClosed = getLocalStorageItem(
+        LS_VERSION_UPDATE_CHECK_LAST_CLOSED
       );
 
-      if (isClosedBefore !== 'true') {
-        const isUpdateAvailable = versionGT(latestServerVersion, serverVersion);
+      if (lastUpdateCheckClosed !== latestServerVersionToCheck) {
+        const isUpdateAvailable = versionGT(
+          latestServerVersionToCheck,
+          serverVersion
+        );
 
         if (isUpdateAvailable) {
           this.setState({
-            showUpdateNotification: true,
+            updateNotificationVersion: latestServerVersionToCheck,
           });
         }
       }
     } catch (e) {
       console.error(e);
     }
-  }
-
-  fetchServerConfig() {
-    const { dispatch } = this.props;
-
-    dispatch(fetchServerConfig());
   }
 
   handleBodyClick(e) {
@@ -145,13 +171,30 @@ class Main extends React.Component {
     });
   }
 
+  updateLocalStorageState() {
+    const s = getProClickState();
+    if (s && 'isProClicked' in s && !s.isProClicked) {
+      setProClickState({
+        isProClicked: !s.isProClicked,
+      });
+      this.setState({
+        proClickState: { ...getProClickState() },
+      });
+    }
+  }
+
+  onProIconClick = () => {
+    this.updateLocalStorageState();
+    this.toggleProPopup();
+  };
+
   closeUpdateBanner() {
-    const { latestServerVersion } = this.props;
-    window.localStorage.setItem(
-      latestServerVersion + '_BANNER_NOTIFICATION_CLOSED',
-      'true'
+    const { updateNotificationVersion } = this.state;
+    setLocalStorageItem(
+      LS_VERSION_UPDATE_CHECK_LAST_CLOSED,
+      updateNotificationVersion
     );
-    this.setState({ showUpdateNotification: false });
+    this.setState({ updateNotificationVersion: null });
   }
 
   render() {
@@ -161,21 +204,16 @@ class Main extends React.Component {
       migrationModeProgress,
       currentSchema,
       serverVersion,
-      latestServerVersion,
       metadata,
+      dispatch,
     } = this.props;
 
-    const styles = require('./Main.scss');
+    const {
+      proClickState: { isProClicked },
+      isPopUpOpen,
+    } = this.state;
 
     const appPrefix = '';
-
-    const logo = require('./images/white-logo.svg');
-    const github = require('./images/Github.svg');
-    const discord = require('./images/Discord.svg');
-    const mail = require('./images/mail.svg');
-    const docs = require('./images/docs-logo.svg');
-    const about = require('./images/console-logo.svg');
-    const pixHeart = require('./images/pix-heart.svg');
 
     const currentLocation = location.pathname;
     const currentActiveBlock = getPathRoot(currentLocation);
@@ -230,7 +268,7 @@ class Main extends React.Component {
         adminSecretHtml = (
           <div className={styles.secureSection}>
             <a
-              href="https://docs.hasura.io/1.0/graphql/manual/deployment/securing-graphql-endpoint.html"
+              href="https://hasura.io/docs/1.0/graphql/manual/deployment/securing-graphql-endpoint.html"
               target="_blank"
               rel="noopener noreferrer"
             >
@@ -250,7 +288,39 @@ class Main extends React.Component {
     const getUpdateNotification = () => {
       let updateNotificationHtml = null;
 
-      if (this.state.showUpdateNotification) {
+      const { updateNotificationVersion } = this.state;
+
+      const isStableRelease = checkStableVersion(updateNotificationVersion);
+
+      const getPreReleaseNote = () => {
+        const handlePreRelNotifOptOut = e => {
+          e.preventDefault();
+          e.stopPropagation();
+
+          this.closeUpdateBanner();
+
+          dispatch(setPreReleaseNotificationOptOutInDB());
+        };
+
+        return (
+          <React.Fragment>
+            <span className={styles.middot}> &middot; </span>
+            <i>
+              This is a pre-release version. Not recommended for production use.
+              <span className={styles.middot}> &middot; </span>
+              <a href={'#'} onClick={handlePreRelNotifOptOut}>
+                Opt out of pre-release notifications
+              </a>
+              <ToolTip
+                message={'Only be notified about stable releases'}
+                placement={'top'}
+              />
+            </i>
+          </React.Fragment>
+        );
+      };
+
+      if (updateNotificationVersion) {
         updateNotificationHtml = (
           <div>
             <div className={styles.phantom} />{' '}
@@ -260,14 +330,14 @@ class Main extends React.Component {
                 <span> Hey there! A new server version </span>
                 <span className={styles.versionUpdateText}>
                   {' '}
-                  {latestServerVersion}
+                  {updateNotificationVersion}
                 </span>
                 <span> is available </span>
                 <span className={styles.middot}> &middot; </span>
                 <a
                   href={
                     'https://github.com/hasura/graphql-engine/releases/tag/' +
-                    latestServerVersion
+                    updateNotificationVersion
                   }
                   target="_blank"
                   rel="noopener noreferrer"
@@ -277,12 +347,13 @@ class Main extends React.Component {
                 <span className={styles.middot}> &middot; </span>
                 <a
                   className={styles.updateLink}
-                  href="https://docs.hasura.io/1.0/graphql/manual/deployment/updating.html"
+                  href="https://hasura.io/docs/1.0/graphql/manual/deployment/updating.html"
                   target="_blank"
                   rel="noopener noreferrer"
                 >
                   <span>Update Now</span>
                 </a>
+                {!isStableRelease && getPreReleaseNote()}
                 <span
                   className={styles.updateBannerClose}
                   onClick={this.closeUpdateBanner.bind(this)}
@@ -294,6 +365,7 @@ class Main extends React.Component {
           </div>
         );
       }
+
       return updateNotificationHtml;
     };
 
@@ -413,16 +485,6 @@ class Main extends React.Component {
       return loveSectionHtml;
     };
 
-    const getHelpDropdownPosStyle = () => {
-      let helpDropdownPosStyle = '';
-
-      if (this.state.loveConsentState.isDismissed) {
-        helpDropdownPosStyle = styles.help_dropdown_menu_heart_dismissed;
-      }
-
-      return helpDropdownPosStyle;
-    };
-
     const getSidebarItem = (
       title,
       icon,
@@ -456,6 +518,65 @@ class Main extends React.Component {
       );
     };
 
+    const getVulnerableVersionNotification = () => {
+      let vulnerableVersionNotificationHtml = null;
+
+      // vulnerable version to fixed version mapping
+      const vulnerableVersionsMapping = {
+        'v1.2.0-beta.5': 'v1.2.1',
+        'v1.2.0': 'v1.2.1',
+      };
+
+      if (Object.keys(vulnerableVersionsMapping).includes(serverVersion)) {
+        const fixedVersion = vulnerableVersionsMapping[serverVersion];
+
+        vulnerableVersionNotificationHtml = (
+          <div>
+            <div className={styles.phantom} />{' '}
+            {/* phantom div to prevent overlapping of banner with content. */}
+            <div
+              className={
+                styles.updateBannerWrapper +
+                ' ' +
+                styles.vulnerableVersionBannerWrapper
+              }
+            >
+              <div className={styles.updateBanner}>
+                <span>
+                  <Icon type={'warning'} /> <b>ATTENTION</b>
+                  <span className={styles.middot}> &middot; </span>
+                  This current server version has a security vulnerability.
+                  Please upgrade to <b>{fixedVersion}</b> immediately
+                </span>
+                <span className={styles.middot}> &middot; </span>
+                <a
+                  href={
+                    'https://github.com/hasura/graphql-engine/releases/tag/' +
+                    fixedVersion
+                  }
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <span>View Changelog</span>
+                </a>
+                <span className={styles.middot}> &middot; </span>
+                <a
+                  className={styles.updateLink}
+                  href="https://hasura.io/docs/1.0/graphql/manual/deployment/updating.html"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <span>Update Now</span>
+                </a>
+              </div>
+            </div>
+          </div>
+        );
+      }
+
+      return vulnerableVersionNotificationHtml;
+    };
+
     return (
       <div className={styles.container}>
         <div className={styles.flexRow}>
@@ -485,7 +606,13 @@ class Main extends React.Component {
                   'Data',
                   'fa-database',
                   tooltips.data,
-                  '/data/schema/' + currentSchema
+                  getSchemaBaseRoute(currentSchema)
+                )}
+                {getSidebarItem(
+                  'Actions',
+                  'fa-cogs',
+                  tooltips.actions,
+                  '/actions/manage/actions'
                 )}
                 {getSidebarItem(
                   'Remote Schemas',
@@ -493,109 +620,44 @@ class Main extends React.Component {
                   tooltips.remoteSchema,
                   '/remote-schemas/manage/schemas'
                 )}
-                {getSidebarItem(
+                {/*                {getSidebarItem(
                   'Events',
                   'fa-cloud',
                   tooltips.events,
                   '/events/manage/triggers'
                 )}
+                {' '}
+*/}{' '}
+                {getSidebarItem(
+                  'Events',
+                  'fa-cloud',
+                  tooltips.events,
+                  '/events/data/manage'
+                )}
               </ul>
             </div>
             <div id="dropdown_wrapper" className={styles.clusterInfoWrapper}>
               {getAdminSecretSection()}
-
+              <div
+                className={`${styles.headerRightNavbarBtn} ${styles.proWrapper}`}
+                onClick={this.onProIconClick}
+              >
+                <span
+                  className={`
+                    ${isProClicked ? styles.proNameClicked : styles.proName}
+                    ${isPopUpOpen ? styles.navActive : ''}`}
+                >
+                  CLOUD
+                </span>
+                {isPopUpOpen && <ProPopup toggleOpen={this.toggleProPopup} />}
+              </div>
               <Link to="/settings">
-                <div className={styles.helpSection + ' ' + styles.settingsIcon}>
+                <div className={styles.headerRightNavbarBtn}>
                   {getMetadataStatusIcon()}
                   {getSettingsSelectedMarker()}
                 </div>
               </Link>
-              <div className={styles.supportSection}>
-                <div
-                  id="help"
-                  className={styles.helpSection + ' dropdown-toggle'}
-                  data-toggle="dropdown"
-                  aria-expanded="false"
-                  aria-haspopup="true"
-                >
-                  <i className={styles.question + ' fa fa-question'} />
-                </div>
-                <ul
-                  className={
-                    'dropdown-menu ' +
-                    styles.help_dropdown_menu +
-                    ' ' +
-                    getHelpDropdownPosStyle()
-                  }
-                  aria-labelledby="help"
-                >
-                  <div className={styles.help_dropdown_menu_container}>
-                    <li className={'dropdown-item'}>
-                      <a
-                        href="https://github.com/hasura/graphql-engine/issues"
-                        target="_blank"
-                        rel="noopener noreferrer"
-                      >
-                        <img
-                          className={'img-responsive'}
-                          src={github}
-                          alt={'github'}
-                        />
-                        <span>Report bugs & suggest improvements</span>
-                      </a>
-                    </li>
-                    <li className={'dropdown-item'}>
-                      <a
-                        href="https://discordapp.com/invite/vBPpJkS"
-                        target="_blank"
-                        rel="noopener noreferrer"
-                      >
-                        <img
-                          className={'img-responsive'}
-                          src={discord}
-                          alt={'discord'}
-                        />
-                        <span>Join discord community forum</span>
-                      </a>
-                    </li>
-                    <li className={'dropdown-item'}>
-                      <a href="mailto:support@hasura.io">
-                        <img
-                          className={'img-responsive'}
-                          src={mail}
-                          alt={'mail'}
-                        />
-                        <span>Reach out ({'support@hasura.io'})</span>
-                      </a>
-                    </li>
-                    <li className={'dropdown-item'}>
-                      <a
-                        href="https://docs.hasura.io/"
-                        target="_blank"
-                        rel="noopener noreferrer"
-                      >
-                        <img
-                          className={'img-responsive'}
-                          src={docs}
-                          alt={'docs'}
-                        />
-                        <span>Head to docs</span>
-                      </a>
-                    </li>
-                    <li className={'dropdown-item'}>
-                      <Link to="/about">
-                        <img
-                          className={'img-responsive'}
-                          src={about}
-                          alt={'about'}
-                        />
-                        <span>About</span>
-                      </Link>
-                    </li>
-                  </div>
-                </ul>
-              </div>
-
+              <Help isSelected={currentActiveBlock === 'support'} />
               {getLoveSection()}
             </div>
           </div>
@@ -605,6 +667,7 @@ class Main extends React.Component {
           </div>
 
           {getUpdateNotification()}
+          {getVulnerableVersionNotification()}
         </div>
       </div>
     );
@@ -618,6 +681,7 @@ const mapStateToProps = (state, ownProps) => {
     pathname: ownProps.location.pathname,
     currentSchema: state.tables.currentSchema,
     metadata: state.metadata,
+    console_opts: state.telemetry.console_opts,
   };
 };
 

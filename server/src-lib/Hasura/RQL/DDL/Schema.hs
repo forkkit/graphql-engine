@@ -20,6 +20,9 @@ load and modify the Hasura catalog and schema cache.
     cache, but to avoid rebuilding the entire schema cache on every change to the catalog, various
     functions incrementally update the cache when they modify the catalog.
 -}
+
+{-# LANGUAGE RecordWildCards #-}
+
 module Hasura.RQL.DDL.Schema
  ( module Hasura.RQL.DDL.Schema.Cache
  , module Hasura.RQL.DDL.Schema.Catalog
@@ -29,6 +32,7 @@ module Hasura.RQL.DDL.Schema
 
  , RunSQL(..)
  , runRunSQL
+ , isSchemaCacheBuildRequiredRunSQL
  ) where
 
 import           Hasura.Prelude
@@ -37,6 +41,7 @@ import qualified Data.Text                      as T
 import qualified Data.Text.Encoding             as TE
 import qualified Database.PG.Query              as Q
 import qualified Database.PostgreSQL.LibPQ      as PQ
+import qualified Text.Regex.TDFA                as TDFA
 
 import           Data.Aeson
 import           Data.Aeson.Casing
@@ -51,35 +56,88 @@ import           Hasura.RQL.DDL.Schema.Rename
 import           Hasura.RQL.DDL.Schema.Table
 import           Hasura.RQL.Instances           ()
 import           Hasura.RQL.Types
-import           Hasura.Server.Utils            (matchRegex)
+import           Hasura.Server.Utils            (quoteRegex)
 
 data RunSQL
   = RunSQL
   { rSql                      :: Text
-  , rCascade                  :: !(Maybe Bool)
+  , rCascade                  :: !Bool
   , rCheckMetadataConsistency :: !(Maybe Bool)
+  , rTxAccessMode             :: !Q.TxAccess
   } deriving (Show, Eq, Lift)
-$(deriveJSON (aesonDrop 1 snakeCase){omitNothingFields=True} ''RunSQL)
 
-runRunSQL :: (CacheBuildM m, UserInfoM m) => RunSQL -> m EncJSON
-runRunSQL (RunSQL t cascade mChkMDCnstcy) = do
-  adminOnly
-  isMDChkNeeded <- maybe (isAltrDropReplace t) return mChkMDCnstcy
-  bool (execRawSQL t) (withMetadataCheck (or cascade) $ execRawSQL t) isMDChkNeeded
+instance FromJSON RunSQL where
+  parseJSON = withObject "RunSQL" $ \o -> do
+    rSql <- o .: "sql"
+    rCascade <- o .:? "cascade" .!= False
+    rCheckMetadataConsistency <- o .:? "check_metadata_consistency"
+    isReadOnly <- o .:? "read_only" .!= False
+    let rTxAccessMode = if isReadOnly then Q.ReadOnly else Q.ReadWrite
+    pure RunSQL{..}
+
+instance ToJSON RunSQL where
+  toJSON RunSQL {..} =
+    object
+      [ "sql" .= rSql
+      , "cascade" .= rCascade
+      , "check_metadata_consistency" .= rCheckMetadataConsistency
+      , "read_only" .=
+        case rTxAccessMode of
+          Q.ReadOnly  -> True
+          Q.ReadWrite -> False
+      ]
+
+-- | see Note [Checking metadata consistency in run_sql]
+isSchemaCacheBuildRequiredRunSQL :: RunSQL -> Bool
+isSchemaCacheBuildRequiredRunSQL RunSQL {..} =
+  case rTxAccessMode of
+    Q.ReadOnly  -> False
+    Q.ReadWrite -> fromMaybe (containsDDLKeyword rSql) rCheckMetadataConsistency
+  where
+    containsDDLKeyword :: Text -> Bool
+    containsDDLKeyword = TDFA.match $$(quoteRegex
+      TDFA.defaultCompOpt
+        { TDFA.caseSensitive = False
+        , TDFA.multiline = True
+        , TDFA.lastStarGreedy = True }
+        TDFA.defaultExecOpt
+        { TDFA.captureGroups = False }
+        "\\balter\\b|\\bdrop\\b|\\breplace\\b|\\bcreate function\\b|\\bcomment on\\b")
+
+runRunSQL :: (MonadTx m, CacheRWM m, HasSQLGenCtx m) => RunSQL -> m EncJSON
+runRunSQL q@RunSQL {..}
+  -- see Note [Checking metadata consistency in run_sql]
+  | isSchemaCacheBuildRequiredRunSQL q
+  = withMetadataCheck rCascade $ execRawSQL rSql
+  | otherwise
+  = execRawSQL rSql
   where
     execRawSQL :: (MonadTx m) => Text -> m EncJSON
     execRawSQL =
       fmap (encJFromJValue @RunSQLRes) . liftTx . Q.multiQE rawSqlErrHandler . Q.fromText
       where
         rawSqlErrHandler txe =
-          let e = err400 PostgresError "query execution failed"
-          in e {qeInternal = Just $ toJSON txe}
+          (err400 PostgresError "query execution failed") { qeInternal = Just $ toJSON txe }
 
-    isAltrDropReplace :: QErrM m => T.Text -> m Bool
-    isAltrDropReplace = either throwErr return . matchRegex regex False
-      where
-        throwErr s = throw500 $ "compiling regex failed: " <> T.pack s
-        regex = "alter|drop|replace|create function|comment on"
+{- Note [Checking metadata consistency in run_sql]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+SQL queries executed by run_sql may change the Postgres schema in arbitrary
+ways. We attempt to automatically update the metadata to reflect those changes
+as much as possible---for example, if a table is renamed, we want to update the
+metadata to track the table under its new name instead of its old one. This
+schema diffing (plus some integrity checking) is handled by withMetadataCheck.
+
+But this process has overhead---it involves reloading the metadata, diffing it,
+and rebuilding the schema cache---so we don’t want to do it if it isn’t
+necessary. The user can explicitly disable the check via the
+check_metadata_consistency option, and we also skip it if the current
+transaction is in READ ONLY mode, since the schema can’t be modified in that
+case, anyway.
+
+However, even if neither read_only or check_metadata_consistency is passed, lots
+of queries may not modify the schema at all. As a (fairly stupid) heuristic, we
+check if the query contains any keywords for DDL operations, and if not, we skip
+the metadata check as well. -}
 
 data RunSQLRes
   = RunSQLRes

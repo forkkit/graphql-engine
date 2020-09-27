@@ -1,43 +1,50 @@
 module Hasura.RQL.DML.Update
-  ( validateUpdateQueryWith
-  , validateUpdateQuery
-  , AnnUpdG(..)
+  ( AnnUpdG(..)
   , traverseAnnUpd
-  , AnnUpd
-  , updateQueryToTx
+  , execUpdateQuery
+  , updateOperatorText
   , runUpdate
   ) where
 
 import           Data.Aeson.Types
-import           Instances.TH.Lift        ()
+import           Instances.TH.Lift           ()
 
-import qualified Data.HashMap.Strict      as M
-import qualified Data.Sequence            as DS
+import qualified Data.HashMap.Strict         as M
+import qualified Data.Sequence               as DS
 
 import           Hasura.EncJSON
 import           Hasura.Prelude
+import           Hasura.RQL.DML.Insert       (insertCheckExpr)
 import           Hasura.RQL.DML.Internal
 import           Hasura.RQL.DML.Mutation
 import           Hasura.RQL.DML.Returning
+import           Hasura.RQL.DML.Update.Types
 import           Hasura.RQL.GBoolExp
-import           Hasura.RQL.Instances     ()
+import           Hasura.RQL.Instances        ()
 import           Hasura.RQL.Types
+import           Hasura.Server.Version       (HasVersion)
+import           Hasura.Session
 import           Hasura.SQL.Types
 
-import qualified Database.PG.Query        as Q
-import qualified Hasura.SQL.DML           as S
+import qualified Database.PG.Query           as Q
+import qualified Hasura.SQL.DML              as S
+import qualified Data.Environment         as Env
+import qualified Hasura.Tracing           as Tracing
 
-data AnnUpdG v
-  = AnnUpd
-  { uqp1Table   :: !QualifiedTable
-  , uqp1SetExps :: ![(PGCol, v)]
-  , uqp1Where   :: !(AnnBoolExp v, AnnBoolExp v)
-  -- we don't prepare the arguments for returning
-  -- however the session variable can still be
-  -- converted as desired
-  , uqp1MutFlds :: !(MutFldsG v)
-  , uqp1AllCols :: ![PGColumnInfo]
-  } deriving (Show, Eq)
+
+-- NOTE: This function can be improved, because we use
+-- the literal values defined below in the 'updateOperators'
+-- function in 'Hasura.GraphQL.Schema.Mutation'. It would
+-- be nice if we could avoid duplicating the string literal
+-- values
+updateOperatorText :: UpdOpExpG a -> Text
+updateOperatorText (UpdSet          _) = "_set"
+updateOperatorText (UpdInc          _) = "_inc"
+updateOperatorText (UpdAppend       _) = "_append"
+updateOperatorText (UpdPrepend      _) = "_prepend"
+updateOperatorText (UpdDeleteKey    _) = "_delete_key"
+updateOperatorText (UpdDeleteElem   _) = "_delete_elem"
+updateOperatorText (UpdDeleteAtPath _) = "_delete_at_path"
 
 traverseAnnUpd
   :: (Applicative f)
@@ -46,24 +53,50 @@ traverseAnnUpd
   -> f (AnnUpdG b)
 traverseAnnUpd f annUpd =
   AnnUpd tn
-  <$> traverse (traverse f) setExps
+  <$> traverse (traverse $ traverse f) opExps
   <*> ((,) <$> traverseAnnBoolExp f whr <*> traverseAnnBoolExp f fltr)
-  <*> traverseMutFlds f mutFlds
+  <*> traverseAnnBoolExp f chk
+  <*> traverseMutationOutput f mutOutput
   <*> pure allCols
   where
-    AnnUpd tn setExps (whr, fltr) mutFlds allCols = annUpd
-
-type AnnUpd = AnnUpdG S.SQLExp
+    AnnUpd tn opExps (whr, fltr) chk mutOutput allCols = annUpd
 
 mkUpdateCTE
   :: AnnUpd -> S.CTE
-mkUpdateCTE (AnnUpd tn setExps (permFltr, wc) _ _) =
+mkUpdateCTE (AnnUpd tn opExps (permFltr, wc) chk _ columnsInfo) =
   S.CTEUpdate update
   where
-    update = S.SQLUpdate tn setExp Nothing tableFltr $ Just S.returningStar
-    setExp    = S.SetExp $ map S.SetExpItem setExps
-    tableFltr = Just $ S.WhereFrag $
-                toSQLBoolExp (S.QualTable tn) $ andAnnBoolExps permFltr wc
+    update =
+      S.SQLUpdate tn setExp Nothing tableFltr
+        . Just
+        . S.RetExp
+        $ [ S.selectStar
+          , S.Extractor (insertCheckExpr "update check constraint failed" checkExpr) Nothing
+          ]
+    setExp    = S.SetExp $ map (expandOperator columnsInfo) opExps
+    tableFltr = Just $ S.WhereFrag tableFltrExpr
+    tableFltrExpr = toSQLBoolExp (S.QualTable tn) $ andAnnBoolExps permFltr wc
+    checkExpr = toSQLBoolExp (S.QualTable tn) chk
+
+expandOperator :: [PGColumnInfo] -> (PGCol, UpdOpExpG S.SQLExp) -> S.SetExpItem
+expandOperator infos (column, op) = S.SetExpItem $ (column,) $ case op of
+  UpdSet          e -> e
+  UpdInc          e -> S.mkSQLOpExp S.incOp               identifier (asNum  e)
+  UpdAppend       e -> S.mkSQLOpExp S.jsonbConcatOp       identifier (asJSON e)
+  UpdPrepend      e -> S.mkSQLOpExp S.jsonbConcatOp       (asJSON e) identifier
+  UpdDeleteKey    e -> S.mkSQLOpExp S.jsonbDeleteOp       identifier (asText e)
+  UpdDeleteElem   e -> S.mkSQLOpExp S.jsonbDeleteOp       identifier (asInt  e)
+  UpdDeleteAtPath a -> S.mkSQLOpExp S.jsonbDeleteAtPathOp identifier (asArray a)
+  where
+    identifier = S.SEIden $ toIden column
+    asInt  e   = S.SETyAnn e S.intTypeAnn
+    asText e   = S.SETyAnn e S.textTypeAnn
+    asJSON e   = S.SETyAnn e S.jsonbTypeAnn
+    asArray a  = S.SETyAnn (S.SEArray a) S.textArrTypeAnn
+    asNum  e   = S.SETyAnn e $
+      case find (\info -> pgiColumn info == column) infos <&> pgiType of
+        Just (PGColumnScalar s) -> S.mkTypeAnn $ PGTypeScalar s
+        _                       -> S.numericTypeAnn
 
 convInc
   :: (QErrM m)
@@ -103,7 +136,7 @@ convDefault col _ _ = return (col, S.SEUnsafe "DEFAULT")
 
 convOp
   :: (UserInfoM m, QErrM m)
-  => FieldInfoMap PGColumnInfo
+  => FieldInfoMap FieldInfo
   -> [PGCol]
   -> UpdPermInfo
   -> [(PGCol, a)]
@@ -122,9 +155,9 @@ convOp fieldInfoMap preSetCols updPerm objs conv =
     allowedCols  = upiCols updPerm
     relWhenPgErr = "relationships can't be updated"
     throwNotUpdErr c = do
-      role <- userRole <$> askUserInfo
+      roleName <- _uiRole <$> askUserInfo
       throw400 NotSupported $ "column " <> c <<> " is not updatable"
-        <> " for role " <> role <<> "; its value is predefined in permission"
+        <> " for role " <> roleName <<> "; its value is predefined in permission"
 
 validateUpdateQueryWith
   :: (UserInfoM m, QErrM m, CacheRM m)
@@ -135,10 +168,11 @@ validateUpdateQueryWith
 validateUpdateQueryWith sessVarBldr prepValBldr uq = do
   let tableName = uqTable uq
   tableInfo <- withPathK "table" $ askTabInfo tableName
+  let coreInfo = _tiCoreInfo tableInfo
 
   -- If it is view then check if it is updatable
   mutableView tableName viIsUpdatable
-    (_tiViewInfo tableInfo) "updatable"
+    (_tciViewInfo coreInfo) "updatable"
 
   -- Check if the role has update permissions
   updPerm <- askUpdPermInfo tableInfo
@@ -150,7 +184,7 @@ validateUpdateQueryWith sessVarBldr prepValBldr uq = do
   selPerm <- modifyErr (<> selNecessaryMsg) $
              askSelPermInfo tableInfo
 
-  let fieldInfoMap = _tiFieldInfoMap tableInfo
+  let fieldInfoMap = _tciFieldInfoMap coreInfo
       allCols = getCols fieldInfoMap
       preSetObj = upiSet updPerm
       preSetCols = M.keys preSetObj
@@ -166,7 +200,7 @@ validateUpdateQueryWith sessVarBldr prepValBldr uq = do
     convOp fieldInfoMap preSetCols updPerm (M.toList $ uqMul uq) $ convMul prepValBldr
 
   defItems <- withPathK "$default" $
-    convOp fieldInfoMap preSetCols updPerm (zip (uqDefault uq) [()..]) convDefault
+    convOp fieldInfoMap preSetCols updPerm ((,()) <$> uqDefault uq) convDefault
 
   -- convert the returning cols into sql returing exp
   mAnnRetCols <- forM mRetCols $ \retCols ->
@@ -175,8 +209,11 @@ validateUpdateQueryWith sessVarBldr prepValBldr uq = do
   resolvedPreSetItems <- M.toList <$>
                          mapM (convPartialSQLExp sessVarBldr) preSetObj
 
-  let setExpItems = resolvedPreSetItems ++ setItems ++ incItems ++
-                    mulItems ++ defItems
+  let setExpItems = resolvedPreSetItems ++
+                    setItems ++
+                    incItems ++
+                    mulItems ++
+                    defItems
 
   when (null setExpItems) $
     throw400 UnexpectedPayload "atleast one of $set, $inc, $mul has to be present"
@@ -187,11 +224,15 @@ validateUpdateQueryWith sessVarBldr prepValBldr uq = do
 
   resolvedUpdFltr <- convAnnBoolExpPartialSQL sessVarBldr $
                      upiFilter updPerm
+  resolvedUpdCheck <- fromMaybe gBoolExpTrue <$>
+                        traverse (convAnnBoolExpPartialSQL sessVarBldr)
+                          (upiCheck updPerm)
 
   return $ AnnUpd
     tableName
-    setExpItems
+    (fmap UpdSet <$> setExpItems)
     (resolvedUpdFltr, annSQLBoolExp)
+    resolvedUpdCheck
     (mkDefaultMutFlds mAnnRetCols)
     allCols
   where
@@ -202,22 +243,35 @@ validateUpdateQueryWith sessVarBldr prepValBldr uq = do
       <> "without \"select\" permission on the table"
 
 validateUpdateQuery
-  :: (QErrM m, UserInfoM m, CacheRM m, HasSQLGenCtx m)
+  :: (QErrM m, UserInfoM m, CacheRM m)
   => UpdateQuery -> m (AnnUpd, DS.Seq Q.PrepArg)
 validateUpdateQuery =
-  liftDMLP1 . validateUpdateQueryWith sessVarFromCurrentSetting binRHSBuilder
+  runDMLP1T . validateUpdateQueryWith sessVarFromCurrentSetting binRHSBuilder
 
-updateQueryToTx
-  :: Bool -> (AnnUpd, DS.Seq Q.PrepArg) -> Q.TxE QErr EncJSON
-updateQueryToTx strfyNum (u, p) =
-  runMutation $ Mutation (uqp1Table u) (updateCTE, p)
-                (uqp1MutFlds u) (uqp1AllCols u) strfyNum
+execUpdateQuery
+  ::
+  ( HasVersion
+  , MonadTx m
+  , MonadIO m
+  , Tracing.MonadTrace m
+  )
+  => Env.Environment
+  -> Bool
+  -> Maybe MutationRemoteJoinCtx
+  -> (AnnUpd, DS.Seq Q.PrepArg)
+  -> m EncJSON
+execUpdateQuery env strfyNum remoteJoinCtx (u, p) =
+  runMutation env $ mkMutation remoteJoinCtx (uqp1Table u) (updateCTE, p)
+                (uqp1Output u) (uqp1AllCols u) strfyNum
   where
     updateCTE = mkUpdateCTE u
 
 runUpdate
-  :: (QErrM m, UserInfoM m, CacheRWM m, MonadTx m, HasSQLGenCtx m)
-  => UpdateQuery -> m EncJSON
-runUpdate q = do
+  :: ( HasVersion, QErrM m, UserInfoM m, CacheRM m
+     , MonadTx m, HasSQLGenCtx m, MonadIO m
+     , Tracing.MonadTrace m
+     )
+  => Env.Environment -> UpdateQuery -> m EncJSON
+runUpdate env q = do
   strfyNum <- stringifyNum <$> askSQLGenCtx
-  validateUpdateQuery q >>= liftTx . updateQueryToTx strfyNum
+  validateUpdateQuery q >>= execUpdateQuery env strfyNum Nothing

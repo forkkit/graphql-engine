@@ -10,7 +10,6 @@ import (
 	"strings"
 
 	"github.com/hasura/graphql-engine/cli"
-	"github.com/hasura/graphql-engine/cli/assets"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"github.com/spf13/cobra/doc"
@@ -25,8 +24,9 @@ func NewDocsCmd(ec *cli.ExecutionContext) *cobra.Command {
 		Short:        "Generate CLI docs in various formats",
 		Hidden:       true,
 		SilenceUsage: true,
-		PreRun: func(cmd *cobra.Command, args []string) {
+		PreRunE: func(cmd *cobra.Command, args []string) error {
 			ec.Viper = viper.New()
+			return nil
 		},
 		RunE: func(cmd *cobra.Command, args []string) (err error) {
 			err = os.MkdirAll(docDirectory, os.ModePerm)
@@ -103,19 +103,12 @@ func genReSTCustom(cmd *cobra.Command, w io.Writer, titlePrefix string, linkHand
 	buf := new(bytes.Buffer)
 	name := cmd.CommandPath()
 	ref := strings.Replace(name, " ", "_", -1)
-	cliDocPath := "manifests/docs/" + ref + ".rst"
 	short := cmd.Short
 	long := cmd.Long
 	if len(long) == 0 {
 		long = short
 	}
-	fileInfo, er := assets.Asset(cliDocPath)
-	var info string
-	if er != nil || string(fileInfo) == "" {
-		info = short
-	} else {
-		info = string(fileInfo)
-	}
+	info := short
 
 	buf.WriteString(".. _" + ref + ":\n\n")
 

@@ -1,6 +1,4 @@
-const createSQLRegex = /create\s*(?:|or\s*replace)\s*(view|table|function)\s*((\"?\w+\"?)\.(\"?\w+\"?)|(\"?\w+\"?))/; // eslint-disable-line
-
-const createSQLRegexNoFunction = /create\s*(?:|or\s*replace)\s*(view|table)\s*((\"?\w+\"?)\.(\"?\w+\"?)|(\"?\w+\"?))/; // eslint-disable-line
+const createSQLRegex = /create\s*(?:|or\s*replace)\s*(view|table|function)\s*(?:\s*if*\s*not\s*exists\s*)?((\"?\w+\"?)\.(\"?\w+\"?)|(\"?\w+\"?))/; // eslint-disable-line
 
 const getSQLValue = value => {
   const quotedStringRegex = /^".*"$/;
@@ -13,7 +11,7 @@ const getSQLValue = value => {
   return sqlValue.replace(/['"]+/g, '');
 };
 
-const parseCreateSQL = sql => {
+export const parseCreateSQL = sql => {
   const _objects = [];
 
   const regExp = createSQLRegex;
@@ -52,4 +50,6 @@ const parseCreateSQL = sql => {
   return _objects;
 };
 
-export { createSQLRegex, createSQLRegexNoFunction, parseCreateSQL };
+export const getStatementTimeoutSql = statementTimeoutInSecs => {
+  return `SET LOCAL statement_timeout = ${statementTimeoutInSecs * 1000};`;
+};

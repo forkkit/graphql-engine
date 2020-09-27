@@ -4,34 +4,30 @@ module Hasura.RQL.DML.Delete
   , AnnDelG(..)
   , traverseAnnDel
   , AnnDel
-  , deleteQueryToTx
+  , execDeleteQuery
   , runDelete
   ) where
 
 import           Data.Aeson
-import           Instances.TH.Lift        ()
+import           Instances.TH.Lift           ()
 
 import qualified Data.Sequence            as DS
+import qualified Data.Environment         as Env
+import qualified Hasura.Tracing           as Tracing
 
 import           Hasura.EncJSON
 import           Hasura.Prelude
+import           Hasura.RQL.DML.Delete.Types
 import           Hasura.RQL.DML.Internal
 import           Hasura.RQL.DML.Mutation
 import           Hasura.RQL.DML.Returning
 import           Hasura.RQL.GBoolExp
+import           Hasura.Server.Version       (HasVersion)
 import           Hasura.RQL.Types
-import           Hasura.SQL.Types
 
-import qualified Database.PG.Query        as Q
-import qualified Hasura.SQL.DML           as S
+import qualified Database.PG.Query           as Q
+import qualified Hasura.SQL.DML              as S
 
-data AnnDelG v
-  = AnnDel
-  { dqp1Table   :: !QualifiedTable
-  , dqp1Where   :: !(AnnBoolExp v, AnnBoolExp v)
-  , dqp1MutFlds :: !(MutFldsG v)
-  , dqp1AllCols :: ![PGColumnInfo]
-  } deriving (Show, Eq)
 
 traverseAnnDel
   :: (Applicative f)
@@ -41,12 +37,10 @@ traverseAnnDel
 traverseAnnDel f annUpd =
   AnnDel tn
   <$> ((,) <$> traverseAnnBoolExp f whr <*> traverseAnnBoolExp f fltr)
-  <*> traverseMutFlds f mutFlds
+  <*> traverseMutationOutput f mutOutput
   <*> pure allCols
   where
-    AnnDel tn (whr, fltr) mutFlds allCols = annUpd
-
-type AnnDel = AnnDelG S.SQLExp
+    AnnDel tn (whr, fltr) mutOutput allCols = annUpd
 
 mkDeleteCTE
   :: AnnDel -> S.CTE
@@ -66,10 +60,11 @@ validateDeleteQWith
 validateDeleteQWith sessVarBldr prepValBldr
   (DeleteQuery tableName rqlBE mRetCols) = do
   tableInfo <- askTabInfo tableName
+  let coreInfo = _tiCoreInfo tableInfo
 
   -- If table is view then check if it deletable
   mutableView tableName viIsDeletable
-    (_tiViewInfo tableInfo) "deletable"
+    (_tciViewInfo coreInfo) "deletable"
 
   -- Check if the role has delete permissions
   delPerm <- askDelPermInfo tableInfo
@@ -81,7 +76,7 @@ validateDeleteQWith sessVarBldr prepValBldr
   selPerm <- modifyErr (<> selNecessaryMsg) $
              askSelPermInfo tableInfo
 
-  let fieldInfoMap = _tiFieldInfoMap tableInfo
+  let fieldInfoMap = _tciFieldInfoMap coreInfo
       allCols = getCols fieldInfoMap
 
   -- convert the returning cols into sql returing exp
@@ -106,21 +101,37 @@ validateDeleteQWith sessVarBldr prepValBldr
       <> "without \"select\" permission on the table"
 
 validateDeleteQ
-  :: (QErrM m, UserInfoM m, CacheRM m, HasSQLGenCtx m)
+  :: (QErrM m, UserInfoM m, CacheRM m)
   => DeleteQuery -> m (AnnDel, DS.Seq Q.PrepArg)
 validateDeleteQ =
-  liftDMLP1 . validateDeleteQWith sessVarFromCurrentSetting binRHSBuilder
+  runDMLP1T . validateDeleteQWith sessVarFromCurrentSetting binRHSBuilder
 
-deleteQueryToTx :: Bool -> (AnnDel, DS.Seq Q.PrepArg) -> Q.TxE QErr EncJSON
-deleteQueryToTx strfyNum (u, p) =
-  runMutation $ Mutation (dqp1Table u) (deleteCTE, p)
-                (dqp1MutFlds u) (dqp1AllCols u) strfyNum
+execDeleteQuery
+  ::
+  ( HasVersion
+  , MonadTx m
+  , MonadIO m
+  , Tracing.MonadTrace m
+  )
+  => Env.Environment
+  -> Bool
+  -> Maybe MutationRemoteJoinCtx
+  -> (AnnDel, DS.Seq Q.PrepArg)
+  -> m EncJSON
+execDeleteQuery env strfyNum remoteJoinCtx (u, p) =
+  runMutation env $ mkMutation remoteJoinCtx (dqp1Table u) (deleteCTE, p)
+                (dqp1Output u) (dqp1AllCols u) strfyNum
   where
     deleteCTE = mkDeleteCTE u
 
 runDelete
-  :: (QErrM m, UserInfoM m, CacheRM m, MonadTx m, HasSQLGenCtx m)
-  => DeleteQuery -> m EncJSON
-runDelete q = do
+  :: ( HasVersion, QErrM m, UserInfoM m, CacheRM m
+     , MonadTx m, HasSQLGenCtx m, MonadIO m
+     , Tracing.MonadTrace m
+     )
+  => Env.Environment
+  -> DeleteQuery
+  -> m EncJSON
+runDelete env q = do
   strfyNum <- stringifyNum <$> askSQLGenCtx
-  validateDeleteQ q >>= liftTx . deleteQueryToTx strfyNum
+  validateDeleteQ q >>= execDeleteQuery env strfyNum Nothing

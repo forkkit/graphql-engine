@@ -8,6 +8,7 @@ import Button from '../../../Common/Button/Button';
 import styles from './PermissionsSummary.scss';
 
 import { getTablePermissionsRoute } from '../../../Common/utils/routesUtils';
+import { permissionsSymbols } from '../../../Common/Permissions/PermissionSymbols';
 import {
   findTable,
   getTableSchema,
@@ -17,20 +18,27 @@ import {
   getTableDef,
   getSchemaTables,
   getTrackedTables,
+  checkIfTable,
 } from '../../../Common/utils/pgUtils';
 import { getConfirmation } from '../../../Common/utils/jsUtils';
 
 import { updateSchemaInfo } from '../DataActions';
-import { copyRolePermissions, permOpenEdit } from '../TablePermissions/Actions';
+import {
+  copyRolePermissions,
+  permOpenEdit,
+  deleteRoleGlobally,
+} from '../TablePermissions/Actions';
 
 import {
-  permissionsSymbols,
   getAllRoles,
   getPermissionFilterString,
   getPermissionColumnAccessSummary,
   getTablePermissionsByRoles,
   getPermissionRowAccessSummary,
 } from './utils';
+
+import Header from './Header';
+import RolesHeader from './RolesHeader';
 
 class PermissionsSummary extends Component {
   initState = {
@@ -181,55 +189,17 @@ class PermissionsSummary extends Component {
       );
     };
 
-    const getHeader = (
-      content,
-      selectable,
-      isSelected,
-      onClick,
-      actionBtn = null,
-      key = null
-    ) => {
-      const getContents = () => {
-        let headerContent;
-
-        if (!actionBtn) {
-          headerContent = content;
-        } else {
-          headerContent = (
-            <div
-              className={
-                styles.actionCell +
-                ' ' +
-                styles.display_flex +
-                ' ' +
-                styles.flex_space_between
-              }
-            >
-              <div>{content}</div>
-              <div>{actionBtn}</div>
-            </div>
-          );
-        }
-
-        return headerContent;
-      };
-
-      return (
-        <th
-          key={key || content}
-          onClick={selectable ? onClick : null}
-          className={`${selectable ? styles.cursorPointer : ''} ${
-            isSelected ? styles.selected : ''
-          }`}
-        >
-          {getContents()}
-        </th>
-      );
-    };
-
     const getCellOnClick = (table, role, action) => {
       return () => {
-        dispatch(push(getTablePermissionsRoute(table)));
+        dispatch(
+          push(
+            getTablePermissionsRoute(
+              getTableSchema(table),
+              getTableName(table),
+              checkIfTable(table)
+            )
+          )
+        );
 
         if (role && action) {
           // TODO: fix this. above redirect clears state set by this
@@ -238,66 +208,46 @@ class PermissionsSummary extends Component {
       };
     };
 
-    const getRolesHeaders = (selectable = true, selectedFirst = false) => {
-      const rolesHeaders = [];
+    const copyOnClick = (e, role) => {
+      e.preventDefault();
+      e.stopPropagation();
 
-      if (!allRoles.length) {
-        rolesHeaders.push(getHeader('No roles', false));
-      } else {
-        allRoles.forEach(role => {
-          const isCurrRole = currRole === role;
+      this.setState({
+        copyState: {
+          ...copyState,
+          copyFromRole: role,
+          copyFromTable: currTable ? getTableNameWithSchema(currTable) : 'all',
+          copyFromAction: currRole ? 'all' : currAction,
+        },
+      });
+    };
 
-          const setRole = () => {
-            this.setState({ currRole: isCurrRole ? null : role });
-            window.scrollTo(0, 0);
-          };
+    const deleteOnClick = (e, role) => {
+      e.preventDefault();
+      e.stopPropagation();
 
-          const getCopyBtn = () => {
-            const copyOnClick = e => {
-              e.preventDefault();
-              e.stopPropagation();
+      const deleteConfirmed = getConfirmation(
+        `This will delete all permissions for the role: "${role}" for all entities in the current Postgres schema`,
+        true,
+        role
+      );
 
-              this.setState({
-                copyState: {
-                  ...copyState,
-                  copyFromRole: role,
-                  copyFromTable: currTable
-                    ? getTableNameWithSchema(currTable)
-                    : 'all',
-                  copyFromAction: currRole ? 'all' : currAction,
-                },
-              });
-            };
-
-            return (
-              <Button
-                color="white"
-                size="xs"
-                onClick={copyOnClick}
-                title="Copy permissions"
-              >
-                {getActionIcon('fa-copy')}
-              </Button>
-            );
-          };
-
-          const roleHeader = getHeader(
-            role,
-            selectable,
-            isCurrRole,
-            setRole,
-            getCopyBtn()
-          );
-
-          if (selectedFirst && isCurrRole) {
-            rolesHeaders.unshift(roleHeader);
-          } else {
-            rolesHeaders.push(roleHeader);
-          }
-        });
+      if (deleteConfirmed) {
+        dispatch(deleteRoleGlobally(role));
       }
+    };
 
-      return rolesHeaders;
+    const setRole = (role, isCurrRole) => {
+      this.setState({ currRole: isCurrRole ? null : role });
+      window.scrollTo(0, 0);
+    };
+
+    const defaultRolesHeaderProps = {
+      allRoles,
+      currentRole: currRole,
+      onCopyClick: copyOnClick,
+      onDeleteClick: deleteOnClick,
+      setRole,
     };
 
     const getRolesCells = (table, roleCellRenderer) => {
@@ -357,7 +307,9 @@ class PermissionsSummary extends Component {
 
       if (!currSchemaTrackedTables.length) {
         tablesRows.push(
-          <tr key={'No tables'}>{getHeader('No tables', false)}</tr>
+          <tr key={'No tables'}>
+            <Header content="No tables" selectable={false} />
+          </tr>
         );
       } else {
         currSchemaTrackedTables.forEach((table, i) => {
@@ -376,13 +328,15 @@ class PermissionsSummary extends Component {
               });
             };
 
-            return getHeader(
-              displayTableName(table),
-              selectable,
-              isCurrTable,
-              setTable,
-              null,
-              tableName
+            return (
+              <Header
+                content={displayTableName(table)}
+                selectable={selectable}
+                isSelected={isCurrTable}
+                onClick={setTable}
+                actionButtons={[]}
+                key={tableName}
+              />
             );
           };
 
@@ -456,10 +410,9 @@ class PermissionsSummary extends Component {
               <div className={styles.add_mar_bottom_small}>
                 <b>Columns</b> -{' '}
                 <i>
-                  {getPermissionColumnAccessSummary(
-                    actionPermission,
-                    table.columns
-                  )}
+                  {getPermissionColumnAccessSummary(actionPermission, {
+                    columns: table.columns,
+                  })}
                 </i>
                 {showDetails && getColumnsDetails()}
               </div>
@@ -488,9 +441,7 @@ class PermissionsSummary extends Component {
       const getTablesColumnTable = () => {
         return (
           <table
-            className={`table table-bordered ${styles.rolesTable} ${
-              styles.remove_margin
-            }`}
+            className={`table table-bordered ${styles.rolesTable} ${styles.remove_margin}`}
           >
             <thead>
               <tr>{getBackBtn('currTable')}</tr>
@@ -620,14 +571,12 @@ class PermissionsSummary extends Component {
 
         return (
           <table
-            className={`table table-bordered ${styles.rolesTable} ${
-              styles.remove_margin
-            }`}
+            className={`table table-bordered ${styles.rolesTable} ${styles.remove_margin}`}
           >
             <thead>
               <tr>
                 {getActionSelector()}
-                {getRolesHeaders(false)}
+                <RolesHeader selectable={false} {...defaultRolesHeaderProps} />
               </tr>
             </thead>
             <tbody>
@@ -652,16 +601,18 @@ class PermissionsSummary extends Component {
           return (
             <tr>
               {getBackBtn('currRole')}
-              {getRolesHeaders(true, true)}
+              <RolesHeader
+                selectable
+                selectedFirst
+                {...defaultRolesHeaderProps}
+              />
             </tr>
           );
         };
 
         return (
           <table
-            className={`table table-bordered ${styles.rolesTable} ${
-              styles.remove_margin
-            }`}
+            className={`table table-bordered ${styles.rolesTable} ${styles.remove_margin}`}
           >
             <thead>{getRolesHeaderRow()}</thead>
           </table>
@@ -692,9 +643,7 @@ class PermissionsSummary extends Component {
 
         return (
           <table
-            className={`table table-bordered ${styles.rolesTable} ${
-              styles.remove_margin
-            }`}
+            className={`table table-bordered ${styles.rolesTable} ${styles.remove_margin}`}
           >
             <thead>{getActionsHeaderRow()}</thead>
             <tbody>{getRoleAllTablesAllActionsRows()}</tbody>
@@ -715,7 +664,7 @@ class PermissionsSummary extends Component {
         return (
           <tr>
             {getActionSelector()}
-            {getRolesHeaders()}
+            <RolesHeader {...defaultRolesHeaderProps} />
           </tr>
         );
       };
@@ -1037,9 +986,7 @@ class PermissionsSummary extends Component {
 
     return (
       <div
-        className={`${styles.clear_fix} ${styles.padd_left} ${
-          styles.fit_content
-        }`}
+        className={`${styles.clear_fix} ${styles.padd_left} ${styles.fit_content}`}
       >
         <Helmet title="Permissions Summary | Hasura" />
         <div className={styles.add_mar_bottom}>

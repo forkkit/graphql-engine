@@ -1,17 +1,14 @@
 module Hasura.GraphQL.Utils
   ( showName
-  , showNamedTy
-  , throwVE
-  , getBaseTy
-  , mapFromL
   , groupTuples
   , groupListWith
   , mkMapWith
   , showNames
+  , simpleGraphQLQuery
+  , getBaseTyWithNestedLevelsCount
   ) where
 
 import           Hasura.Prelude
-import           Hasura.RQL.Types.Error
 
 import qualified Data.HashMap.Strict           as Map
 import qualified Data.List.NonEmpty            as NE
@@ -21,23 +18,14 @@ import qualified Language.GraphQL.Draft.Syntax as G
 showName :: G.Name -> Text
 showName name = "\"" <> G.unName name <> "\""
 
-throwVE :: (MonadError QErr m) => Text -> m a
-throwVE = throw400 ValidationFailed
-
-showNamedTy :: G.NamedType -> Text
-showNamedTy nt =
-  "'" <> G.showNT nt <> "'"
-
-getBaseTy :: G.GType -> G.NamedType
-getBaseTy = \case
-  G.TypeNamed _ n     -> n
-  G.TypeList _ lt     -> getBaseTyL lt
+getBaseTyWithNestedLevelsCount :: G.GType -> (G.Name, Int)
+getBaseTyWithNestedLevelsCount ty = go ty 0
   where
-    getBaseTyL = getBaseTy . G.unListType
-
-mapFromL :: (Eq k, Hashable k) => (a -> k) -> [a] -> Map.HashMap k a
-mapFromL f l =
-  Map.fromList [(f v, v) | v <- l]
+    go :: G.GType -> Int -> (G.Name, Int)
+    go gType ctr =
+      case gType of
+        G.TypeNamed _ n      -> (n, ctr)
+        G.TypeList  _ gType' -> flip go (ctr + 1) gType'
 
 groupListWith
   :: (Eq k, Hashable k, Foldable t, Functor t)
@@ -70,3 +58,7 @@ mkMapWith f l =
 showNames :: (Foldable t) => t G.Name -> Text
 showNames names =
   T.intercalate ", " $ map G.unName $ toList names
+
+-- A simple graphql query to be used in generators
+simpleGraphQLQuery :: Text
+simpleGraphQLQuery = "query {author {id name}}"

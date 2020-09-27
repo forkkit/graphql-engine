@@ -106,6 +106,7 @@ args:
         - articles:
             is_published:
               _eq: true
+      limit: 10
 
 #Author select permission for anonymous users
 #Only authors with atleast one article will be shown
@@ -282,6 +283,42 @@ args:
     name: search_tracks
     schema: public
 
+#Create Books table
+- type: run_sql
+  args:
+    sql: |
+      CREATE TABLE books (
+        id int,
+        author_name text,
+        book_name text,
+        published_on timestamptz,
+        PRIMARY KEY (id,book_name)
+      );
+
+# Track table Books
+- type: track_table
+  args:
+    schema: public
+    name: books
+
+- type: insert
+  args:
+    table: books
+    objects:
+      - id: 1
+        author_name: J.K. Rowling
+        book_name: Harry Porter
+        published_on: "1997-06-26"
+
+#Create select permission on books, granting permission only to one of the columns of the primary key
+- type: create_select_permission
+  args:
+    table: books
+    role: user
+    permission:
+      columns: ["author_name","book_name","published_on"]
+      filter: {}
+
 #Permission based on PostGIS operators
 - type: run_sql
   args:
@@ -291,7 +328,17 @@ args:
 - type: run_sql
   args:
     sql: |
-     CREATE EXTENSION IF NOT EXISTS postgis_topology;
+      DO $$
+      BEGIN
+        IF PostGIS_lib_version() ~ '^3.*' THEN
+          CREATE EXTENSION IF NOT EXISTS postgis_raster;
+        END IF;
+      END$$;
+
+- type: run_sql
+  args:
+    sql: |
+      CREATE EXTENSION IF NOT EXISTS postgis_topology;
 
 #Create table
 - type: run_sql
@@ -324,6 +371,10 @@ args:
             distance: 1
             from:
               type: Polygon
+              crs:
+                type: name
+                properties:
+                  name: urn:ogc:def:crs:EPSG::4326
               coordinates:
               - - - 2
                   - 0
@@ -356,11 +407,11 @@ args:
     sql: |
       INSERT INTO geom_table (type, geom_col)
       VALUES
-      ('point', ST_GeomFromText('POINT(1 2)')),
-      ('linestring', ST_GeomFromText('LINESTRING(0 0, 0.5 1, 1 2, 1.5 3)')),
-      ('linestring', ST_GeomFromText('LINESTRING(1 0, 0.5 0.5, 0 1)')),
-      ('polygon', ST_GeomFromText('POLYGON((0 0, 0 1, 1 1, 1 0, 0 0))')),
-      ('polygon', ST_GeomFromText('POLYGON((2 0, 2 1, 3 1, 3 0, 2 0))'))
+      ('point', ST_GeomFromEWKT('SRID=4326;POINT(1 2)')),
+      ('linestring', ST_GeomFromEWKT('SRID=4326;LINESTRING(0 0, 0.5 1, 1 2, 1.5 3)')),
+      ('linestring', ST_GeomFromEWKT('SRID=4326;LINESTRING(1 0, 0.5 0.5, 0 1)')),
+      ('polygon', ST_GeomFromEWKT('SRID=4326;POLYGON((0 0, 0 1, 1 1, 1 0, 0 0))')),
+      ('polygon', ST_GeomFromEWKT('SRID=4326;POLYGON((2 0, 2 1, 3 1, 3 0, 2 0))'))
       ;
 
 
@@ -508,3 +559,24 @@ args:
       columns:
       - id
       - bid_price
+
+- type: create_select_permission
+  args:
+    table: article
+    role: critic
+    permission:
+      columns:
+      - title
+      - content
+      - is_published
+      filter:
+        id:
+          _eq: X-Hasura-Critic-Id
+
+- type: create_select_permission
+  args:
+    table: author
+    role: critic
+    permission:
+      columns: ["name"]
+      filter: {}

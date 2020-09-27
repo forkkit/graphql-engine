@@ -1,16 +1,19 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import 'react-table/react-table.css';
 import '../../../Common/TableCommon/ReactTableOverrides.css';
-import DragFoldTable from '../../../Common/TableCommon/DragFoldTable';
+import DragFoldTable, {
+  getColWidth,
+} from '../../../Common/TableCommon/DragFoldTable';
 
 import Dropdown from '../../../Common/Dropdown/Dropdown';
 
-import InvokeManualTrigger from '../../EventTrigger/Common/InvokeManualTrigger/InvokeManualTrigger';
+import InvokeManualTrigger from '../../Events/EventTriggers/InvokeManualTrigger/InvokeManualTrigger';
 
 import {
   vExpandRel,
   vCloseRel,
   V_SET_ACTIVE,
+  deleteItems,
   deleteItem,
   vExpandRow,
   vCollapseRow,
@@ -27,13 +30,34 @@ import {
 } from './FilterActions';
 
 import _push from '../push';
-import { ordinalColSort, findTableFromRel } from '../utils';
+import { ordinalColSort } from '../utils';
 import FilterQuery from './FilterQuery';
 import Spinner from '../../../Common/Spinner/Spinner';
 import Button from '../../../Common/Button/Button';
 
 import { E_SET_EDITITEM } from './EditActions';
 import { I_SET_CLONE } from '../TableInsertItem/InsertActions';
+import {
+  getTableInsertRowRoute,
+  getTableEditRowRoute,
+} from '../../../Common/utils/routesUtils';
+import {
+  findTable,
+  getRelationshipRefTable,
+  getTableName,
+  getTableSchema,
+  arrayToPostgresArray,
+} from '../../../Common/utils/pgUtils';
+import { updateSchemaInfo } from '../DataActions';
+import {
+  persistColumnCollapseChange,
+  getPersistedCollapsedColumns,
+  persistColumnOrderChange,
+  getPersistedColumnsOrder,
+  persistPageSizeChange,
+} from './localStorageUtils';
+import { compareRows, isTableWithPK } from './utils';
+import styles from '../../../Common/TableCommon/Table.scss';
 
 const ViewRows = ({
   curTableName,
@@ -59,8 +83,16 @@ const ViewRows = ({
   updateInvocationFunction,
   triggeredRow,
   triggeredFunction,
+  location,
+  readOnlyMode,
+  shouldHidePagination,
 }) => {
-  const styles = require('../../../Common/TableCommon/Table.scss');
+  const [selectedRows, setSelectedRows] = useState([]);
+  useEffect(() => {
+    setSelectedRows([]);
+  }, [curTableName, currentSchema]);
+
+  const NO_PRIMARY_KEY_MSG = 'No primary key to identify row';
 
   // Invoke manual trigger status
   const invokeTrigger = (trigger, row) => {
@@ -71,6 +103,14 @@ const ViewRows = ({
   const onCloseInvokeTrigger = () => {
     updateInvocationRow(-1);
     updateInvocationFunction(null);
+  };
+
+  const handleAllCheckboxChange = e => {
+    if (e.target.checked) {
+      setSelectedRows(curRows);
+    } else {
+      setSelectedRows([]);
+    }
   };
 
   const checkIfSingleRow = _curRelName => {
@@ -97,72 +137,8 @@ const ViewRows = ({
     return _isSingleRow;
   };
 
-  const checkIfHasPrimaryKey = _tableSchema => {
-    return (
-      _tableSchema.primary_key && _tableSchema.primary_key.columns.length > 0
-    );
-  };
-
-  const getGridHeadings = (_columns, _relationships) => {
+  const getGridHeadings = (_columns, _relationships, _disableBulkSelect) => {
     const _gridHeadings = [];
-
-    const getColWidth = (header, contentRows = []) => {
-      const MAX_WIDTH = 600;
-      const HEADER_PADDING = 42;
-      const CONTENT_PADDING = 18;
-      const HEADER_FONT = 'bold 16px Gudea';
-      const CONTENT_FONT = '14px Gudea';
-
-      const getTextWidth = (text, font) => {
-        // Doesn't work well with non-monospace fonts
-        // const CHAR_WIDTH = 8;
-        // return text.length * CHAR_WIDTH;
-
-        // if given, use cached canvas for better performance
-        // else, create new canvas
-        const canvas =
-          getTextWidth.canvas ||
-          (getTextWidth.canvas = document.createElement('canvas'));
-
-        const context = canvas.getContext('2d');
-        context.font = font;
-
-        const metrics = context.measureText(text);
-        return metrics.width;
-      };
-
-      let maxContentWidth = 0;
-      for (let i = 0; i < contentRows.length; i++) {
-        if (contentRows[i] !== undefined && contentRows[i][header] !== null) {
-          const content = contentRows[i][header];
-
-          let contentString;
-          if (content === null || content === undefined) {
-            contentString = 'NULL';
-          } else if (typeof content === 'object') {
-            contentString = JSON.stringify(content, null, 4);
-          } else {
-            contentString = content.toString();
-          }
-
-          const currLength = getTextWidth(contentString, CONTENT_FONT);
-
-          if (currLength > maxContentWidth) {
-            maxContentWidth = currLength;
-          }
-        }
-      }
-
-      const maxContentCellWidth = maxContentWidth + CONTENT_PADDING;
-
-      const headerCellWidth =
-        getTextWidth(header, HEADER_FONT) + HEADER_PADDING;
-
-      return Math.min(
-        MAX_WIDTH,
-        Math.max(maxContentCellWidth, headerCellWidth)
-      );
-    };
 
     _gridHeadings.push({
       Header: '',
@@ -171,13 +147,32 @@ const ViewRows = ({
       width: 152,
     });
 
+    _gridHeadings.push({
+      Header: (
+        <div className={styles.tableCenterContent}>
+          <input
+            className={`${styles.inputCheckbox} ${styles.headerInputCheckbox}`}
+            checked={
+              curRows.length > 0 && selectedRows.length === curRows.length
+            }
+            disabled={_disableBulkSelect}
+            title={_disableBulkSelect ? 'No primary key to identify row' : ''}
+            type="checkbox"
+            onChange={handleAllCheckboxChange}
+            data-test="select-all-rows"
+          />
+        </div>
+      ),
+      accessor: 'tableRowSelectAction',
+      id: 'tableRowSelectAction',
+      width: 60,
+    });
+
     _columns.map(col => {
       const columnName = col.column_name;
 
       let sortIcon = 'fa-sort';
       if (curQuery.order_by && curQuery.order_by.length) {
-        sortIcon = '';
-
         curQuery.order_by.forEach(orderBy => {
           if (orderBy.column === columnName) {
             sortIcon = orderBy.type === 'asc' ? 'fa-caret-up' : 'fa-caret-down';
@@ -187,7 +182,7 @@ const ViewRows = ({
 
       _gridHeadings.push({
         Header: (
-          <div className="ellipsis" title="Click to sort">
+          <div className="ellipsis">
             <span className={styles.tableHeaderCell}>
               {columnName} <i className={'fa ' + sortIcon} />
             </span>
@@ -219,7 +214,44 @@ const ViewRows = ({
     return _gridHeadings;
   };
 
-  const getGridRows = (_tableSchema, _hasPrimaryKey, _isSingleRow) => {
+  const handleCheckboxChange = (row, e, tableSchema) => {
+    if (e.target.checked) {
+      setSelectedRows(prev => [...prev, row]);
+    } else {
+      setSelectedRows(prev =>
+        prev.filter(prevRow => !compareRows(prevRow, row, tableSchema, isView))
+      );
+    }
+  };
+
+  const getPKClause = (row, hasPrimaryKey, tableSchema) => {
+    const pkClause = {};
+
+    if (!isView && hasPrimaryKey) {
+      tableSchema.primary_key.columns.map(pk => {
+        pkClause[pk] = row[pk];
+      });
+    } else {
+      tableSchema.columns.map(k => {
+        pkClause[k.column_name] = row[k.column_name];
+      });
+    }
+
+    Object.keys(pkClause).forEach(key => {
+      if (Array.isArray(pkClause[key])) {
+        pkClause[key] = arrayToPostgresArray(pkClause[key]);
+      }
+    });
+
+    return pkClause;
+  };
+
+  const getGridRows = (
+    _tableSchema,
+    _hasPrimaryKey,
+    _isSingleRow,
+    _disableBulkSelect
+  ) => {
     const _gridRows = [];
 
     curRows.forEach((row, rowIndex) => {
@@ -227,22 +259,6 @@ const ViewRows = ({
 
       const rowCellIndex = `${curTableName}-${rowIndex}`;
       const isExpanded = expandedRow === rowCellIndex;
-
-      const getPKClause = () => {
-        const pkClause = {};
-
-        if (!isView && _hasPrimaryKey) {
-          _tableSchema.primary_key.columns.map(pk => {
-            pkClause[pk] = row[pk];
-          });
-        } else {
-          _tableSchema.columns.map(k => {
-            pkClause[k.column_name] = row[k.column_name];
-          });
-        }
-
-        return pkClause;
-      };
 
       const getActionButtons = () => {
         let editButton;
@@ -285,8 +301,12 @@ const ViewRows = ({
           let title;
           let handleClick;
 
-          const handleExpand = () => dispatch(vExpandRow(rowCellIndex));
-          const handleCollapse = () => dispatch(vCollapseRow());
+          const handleExpand = () => {
+            dispatch(vExpandRow(rowCellIndex));
+          };
+          const handleCollapse = () => {
+            dispatch(vCollapseRow());
+          };
 
           if (isExpanded) {
             icon = 'fa-compress';
@@ -309,7 +329,7 @@ const ViewRows = ({
           const handleEditClick = () => {
             dispatch({ type: E_SET_EDITITEM, oldItem: row, pkClause });
             dispatch(
-              _push(`/schema/${currentSchema}/tables/${curTableName}/edit`)
+              _push(getTableEditRowRoute(currentSchema, curTableName, true))
             );
           };
 
@@ -328,7 +348,10 @@ const ViewRows = ({
           const deleteIcon = <i className="fa fa-trash" />;
 
           const handleDeleteClick = () => {
-            dispatch(deleteItem(pkClause));
+            setSelectedRows(prev =>
+              prev.filter(r => !compareRows(r, pkClause, _tableSchema, isView))
+            );
+            dispatch(deleteItem(pkClause, curTableName, currentSchema));
           };
 
           const deleteTitle = 'Delete row';
@@ -348,7 +371,7 @@ const ViewRows = ({
           const handleCloneClick = () => {
             dispatch({ type: I_SET_CLONE, clone: row });
             dispatch(
-              _push(`/schema/${currentSchema}/tables/${curTableName}/insert`)
+              _push(getTableInsertRowRoute(currentSchema, curTableName, true))
             );
           };
 
@@ -425,10 +448,10 @@ const ViewRows = ({
           );
         };
 
-        const showActionBtns = !_isSingleRow && !isView;
+        const showActionBtns = !readOnlyMode && !_isSingleRow && !isView;
 
         if (showActionBtns) {
-          const pkClause = getPKClause();
+          const pkClause = getPKClause(row, _hasPrimaryKey, _tableSchema);
 
           editButton = getEditButton(pkClause);
           deleteButton = getDeleteButton(pkClause);
@@ -441,7 +464,10 @@ const ViewRows = ({
         manualTriggersButton = getManualTriggersButton();
 
         return (
-          <div key={rowIndex} className={styles.tableCellCenterAligned}>
+          <div
+            key={rowIndex}
+            className={`${styles.tableCenterContent} ${styles.overflowUnset}`}
+          >
             {cloneButton}
             {editButton}
             {deleteButton}
@@ -453,6 +479,23 @@ const ViewRows = ({
 
       // Insert Edit, Delete, Clone in a cell
       newRow.tableRowActionButtons = getActionButtons();
+
+      // Check for bulk actions
+      newRow.tableRowSelectAction = (
+        <div className={styles.tableCenterContent}>
+          <input
+            className={styles.inputCheckbox}
+            type="checkbox"
+            disabled={_disableBulkSelect}
+            title={_disableBulkSelect ? NO_PRIMARY_KEY_MSG : ''}
+            checked={selectedRows.some(selectedRow =>
+              compareRows(selectedRow, row, _tableSchema, isView)
+            )}
+            onChange={e => handleCheckboxChange(row, e, _tableSchema, isView)}
+            data-test={`row-checkbox-${rowIndex}`}
+          />
+        </div>
+      );
 
       // Insert column cells
       _tableSchema.columns.forEach(col => {
@@ -484,7 +527,11 @@ const ViewRows = ({
           } else if (rowColumnValue === undefined) {
             cellValue = 'NULL';
             cellTitle = cellValue;
-          } else if (typeof rowColumnValue === 'object') {
+          } else if (
+            col.data_type === 'json' ||
+            col.data_type === 'jsonb' ||
+            typeof rowColumnValue === 'object'
+          ) {
             cellValue = JSON.stringify(rowColumnValue, null, 4);
             cellTitle = cellValue;
           } else {
@@ -543,11 +590,24 @@ const ViewRows = ({
               cellValue = <i>NULL</i>;
             } else {
               // can be expanded
-              const pkClause = getPKClause();
+              const pkClause = getPKClause(row, _hasPrimaryKey, _tableSchema);
 
               const handleViewClick = e => {
                 e.preventDefault();
-                dispatch(vExpandRel(curPath, rel.rel_name, pkClause));
+
+                const childTableDef = getRelationshipRefTable(
+                  _tableSchema,
+                  rel
+                );
+                if (childTableDef.schema !== currentSchema) {
+                  dispatch(
+                    updateSchemaInfo({ schemas: [childTableDef.schema] })
+                  ).then(() => {
+                    dispatch(vExpandRel(curPath, rel.rel_name, pkClause));
+                  });
+                } else {
+                  dispatch(vExpandRel(curPath, rel.rel_name, pkClause));
+                }
               };
 
               cellValue = getRelExpander('View', '', handleViewClick);
@@ -574,13 +634,24 @@ const ViewRows = ({
   const tableColumnsSorted = tableSchema.columns.sort(ordinalColSort);
   const tableRelationships = tableSchema.relationships;
 
-  const hasPrimaryKey = checkIfHasPrimaryKey(tableSchema);
+  const hasPrimaryKey = isTableWithPK(tableSchema);
 
   const isSingleRow = checkIfSingleRow(curRelName);
 
-  const _gridHeadings = getGridHeadings(tableColumnsSorted, tableRelationships);
+  const disableBulkSelect = !hasPrimaryKey;
 
-  const _gridRows = getGridRows(tableSchema, hasPrimaryKey, isSingleRow);
+  const _gridHeadings = getGridHeadings(
+    tableColumnsSorted,
+    tableRelationships,
+    disableBulkSelect
+  );
+
+  const _gridRows = getGridRows(
+    tableSchema,
+    hasPrimaryKey,
+    isSingleRow,
+    disableBulkSelect
+  );
 
   const getFilterQuery = () => {
     let _filterQuery = null;
@@ -598,7 +669,7 @@ const ViewRows = ({
         if ('order_by' in curFilter) {
           orderBy = [...curFilter.order_by];
         }
-        const limit = 'limit' in curFilter ? curFilter.limit : 10;
+
         const offset = 'offset' in curFilter ? curFilter.offset : 0;
 
         _filterQuery = (
@@ -607,17 +678,48 @@ const ViewRows = ({
             whereAnd={wheres}
             tableSchema={tableSchema}
             orderBy={orderBy}
-            limit={limit}
             dispatch={dispatch}
             count={count}
             tableName={curTableName}
             offset={offset}
+            urlQuery={location && location.query}
           />
         );
       }
     }
 
     return _filterQuery;
+  };
+
+  const getSelectedRowsSection = () => {
+    const handleDeleteItems = () => {
+      const pkClauses = selectedRows.map(row =>
+        getPKClause(row, hasPrimaryKey, tableSchema)
+      );
+      dispatch(deleteItems(pkClauses, curTableName, currentSchema));
+      setSelectedRows([]);
+    };
+
+    let selectedRowsSection = null;
+
+    if (selectedRows.length > 0) {
+      selectedRowsSection = (
+        <div className={`${styles.display_flex} ${styles.add_padd_left_18}`}>
+          <b className={styles.padd_small_right}>Selected:</b>
+          {selectedRows.length}
+          <button
+            className={`${styles.add_mar_right_small} btn btn-xs btn-default ${styles.bulkDeleteButton}`}
+            title="Delete selected rows"
+            onClick={handleDeleteItems}
+            data-test="bulk-delete"
+          >
+            <i className="fa fa-trash" />
+          </button>
+        </div>
+      );
+    }
+
+    return selectedRowsSection;
   };
 
   // If query object has expanded columns
@@ -661,14 +763,14 @@ const ViewRows = ({
             childRows = [childRows];
           }
 
-          // Find the name of this childTable using the rel
+          const childTableDef = getRelationshipRefTable(tableSchema, rel);
+          const childTable = findTable(schemas, childTableDef);
+
           return (
             <ViewRows
               key={i}
-              curTableName={
-                findTableFromRel(schemas, tableSchema, rel).table_name
-              }
-              currentSchema={currentSchema}
+              curTableName={getTableName(childTable)}
+              currentSchema={getTableSchema(childTable)}
               curQuery={cq}
               curFilter={curFilter}
               curPath={[...curPath, rel.rel_name]}
@@ -682,6 +784,7 @@ const ViewRows = ({
               curDepth={curDepth + 1}
               dispatch={dispatch}
               expandedRow={expandedRow}
+              readOnlyMode={readOnlyMode}
             />
           );
         }
@@ -711,6 +814,12 @@ const ViewRows = ({
         </div>
       );
     }
+
+    const collapsedColumns = getPersistedCollapsedColumns(
+      curTableName,
+      currentSchema
+    );
+    const columnsOrder = getPersistedColumnsOrder(curTableName, currentSchema);
 
     let disableSortColumn = false;
 
@@ -801,6 +910,7 @@ const ViewRows = ({
       if (curFilter.offset !== page * curFilter.limit) {
         dispatch(setOffset(page * curFilter.limit));
         dispatch(runQuery(tableSchema));
+        setSelectedRows([]);
       }
     };
 
@@ -809,14 +919,17 @@ const ViewRows = ({
         dispatch(setLimit(size));
         dispatch(setOffset(0));
         dispatch(runQuery(tableSchema));
+        setSelectedRows([]);
+        persistPageSizeChange(size);
       }
     };
 
     return (
       <DragFoldTable
-        className="-highlight -fit-content"
+        className="dataTable -highlight -fit-content"
         data={_gridRows}
         columns={_gridHeadings}
+        headerTitle={'Click to sort / Drag to rearrange'}
         resizable
         manual
         sortable={false}
@@ -829,6 +942,19 @@ const ViewRows = ({
         onPageChange={handlePageChange}
         onPageSizeChange={handlePageSizeChange}
         page={Math.floor(curFilter.offset / curFilter.limit)}
+        onCollapseChange={collapsedData =>
+          persistColumnCollapseChange(
+            curTableName,
+            currentSchema,
+            collapsedData
+          )
+        }
+        defaultCollapsed={collapsedColumns}
+        onOrderChange={reorderData =>
+          persistColumnOrderChange(curTableName, currentSchema, reorderData)
+        }
+        defaultReorders={columnsOrder}
+        showPagination={!shouldHidePagination}
       />
     );
   };
@@ -843,6 +969,7 @@ const ViewRows = ({
     <div className={isVisible ? '' : 'hide '}>
       {getFilterQuery()}
       <div className={`row ${styles.add_mar_top}`}>
+        {getSelectedRowsSection()}
         <div className="col-xs-12">
           <div className={styles.tableContainer}>{renderTableBody()}</div>
           <br />

@@ -12,6 +12,8 @@ from enum import Enum
 
 import time
 
+HGE_URLS=[]
+
 def mkJSONResp(graphql_result):
     return Response(HTTPStatus.OK, graphql_result.to_dict(),
                     {'Content-Type': 'application/json'})
@@ -579,10 +581,14 @@ class Echo(graphene.ObjectType):
 class EchoQuery(graphene.ObjectType):
     echo = graphene.Field(
                 Echo,
-                int_input=graphene.Int( default_value=1234),
+                int_input=graphene.Int(default_value=1234),
                 list_input=graphene.Argument(graphene.List(graphene.String), default_value=["hi","there"]),
                 obj_input=graphene.Argument(SizeInput, default_value=SizeInput.default()),
                 enum_input=graphene.Argument(GQColorEnum, default_value=GQColorEnum.RED.name),
+                r_int_input=graphene.Int(required=True, default_value=1234),
+                r_list_input=graphene.Argument(graphene.List(graphene.String, required=True), default_value=["general","Kenobi"]),
+                r_obj_input=graphene.Argument(SizeInput, required=True, default_value=SizeInput.default()),
+                r_enum_input=graphene.Argument(GQColorEnum, required=True, default_value=GQColorEnum.RED.name),
             )
 
     def resolve_echo(self, info, int_input, list_input, obj_input, enum_input):
@@ -615,12 +621,16 @@ class HeaderTest(graphene.ObjectType):
 
     def resolve_wassup(self, info, arg):
         headers = info.context
+        hosts = list(map(lambda o: urlparse(o).netloc, HGE_URLS))
         if not (headers.get_all('x-hasura-test') == ['abcd'] and
                 headers.get_all('x-hasura-role') == ['user'] and
                 headers.get_all('x-hasura-user-id') == ['abcd1234'] and
                 headers.get_all('content-type') == ['application/json'] and
-                headers.get_all('Authorization') == ['Bearer abcdef']):
-            raise Exception('headers dont match. Received: ' + headers)
+                headers.get_all('Authorization') == ['Bearer abcdef'] and
+                len(headers.get_all('x-forwarded-host')) == 1 and
+                all(host in headers.get_all('x-forwarded-host') for host in hosts) and
+                headers.get_all('x-forwarded-user-agent') == ['python-requests/2.22.0']):
+            raise Exception('headers dont match. Received: ' + str(headers))
 
         return "Hello " + arg
 
@@ -635,6 +645,54 @@ class HeaderTestGraphQL(RequestHandler):
             return Response(HTTPStatus.BAD_REQUEST)
         res = header_test_schema.execute(request.json['query'],
                                          context=request.headers)
+        return mkJSONResp(res)
+
+
+class Message(graphene.ObjectType):
+    id = graphene.Int()
+    msg = graphene.String()
+    def __init__(self, id, msg):
+        self.id = id
+        self.msg = msg
+
+    def resolve_id(self, info):
+        return self.id
+
+    def resolve_msg(self, info):
+        return self.msg
+
+    @staticmethod
+    def get_by_id(_id):
+        xs = list(filter(lambda u: u.id == _id, all_messages))
+        if not xs:
+            return None
+        return xs[0]
+
+all_messages = [
+    Message(1, 'You win!'),
+    Message(2, 'You lose!')
+]
+
+class MessagesQuery(graphene.ObjectType):
+    message = graphene.Field(Message, id=graphene.Int(required=True))
+    messages = graphene.List(Message)
+
+    def resolve_message(self, info, id):
+        return Message.get_by_id(id)
+
+    def resolve_messages(self, info):
+        return all_messages
+
+messages_schema = graphene.Schema(query=MessagesQuery)
+
+class MessagesGraphQL(RequestHandler):
+    def get(self, request):
+        return Response(HTTPStatus.METHOD_NOT_ALLOWED)
+
+    def post(self, request):
+        if not request.json:
+            return Response(HTTPStatus.BAD_REQUEST)
+        res = messages_schema.execute(request.json['query'])
         return mkJSONResp(res)
 
 handlers = MkHandlers({
@@ -658,7 +716,8 @@ handlers = MkHandlers({
     '/default-value-echo-graphql' : EchoGraphQL,
     '/person-graphql': PersonGraphQL,
     '/header-graphql': HeaderTestGraphQL,
-    '/auth-graphql': SampleAuthGraphQL,
+    '/messages-graphql' : MessagesGraphQL,
+    '/auth-graphql': SampleAuthGraphQL
 })
 
 
@@ -668,6 +727,10 @@ def create_server(host='127.0.0.1', port=5000):
 def stop_server(server):
     server.shutdown()
     server.server_close()
+
+def set_hge_urls(hge_urls = []):
+    global HGE_URLS
+    HGE_URLS=hge_urls
 
 if __name__ == '__main__':
     s = create_server(host='0.0.0.0')

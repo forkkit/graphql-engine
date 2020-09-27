@@ -3,14 +3,16 @@ import { connect } from 'react-redux';
 import { Link } from 'react-router';
 
 import LeftSubSidebar from '../../Common/Layout/LeftSubSidebar/LeftSubSidebar';
-import gqlPattern from './Common/GraphQLValidation';
 import GqlCompatibilityWarning from '../../Common/GqlCompatibilityWarning/GqlCompatibilityWarning';
 import {
   displayTableName,
   getFunctionName,
   getSchemaTables,
   getTableName,
+  checkIfTable,
+  getFunctionSchema,
 } from '../../Common/utils/pgUtils';
+import { isEmpty } from '../../Common/utils/jsUtils';
 import {
   getFunctionModifyRoute,
   getSchemaAddTableRoute,
@@ -90,7 +92,7 @@ class DataSubSidebar extends React.Component {
 
       const currentLocation = location.pathname;
 
-      let tableLinks;
+      let tableLinks = [];
       if (filteredTableList && filteredTableList.length) {
         const filteredTablesObject = {};
         filteredTableList.forEach(t => {
@@ -105,45 +107,37 @@ class DataSubSidebar extends React.Component {
           const isActive =
             tableName === currentTable && currentLocation.includes(tableName);
 
-          let gqlCompatibilityWarning = null;
-          if (!gqlPattern.test(tableName)) {
-            gqlCompatibilityWarning = (
-              <span className={styles.add_mar_left_mid}>
-                <GqlCompatibilityWarning />
-              </span>
-            );
-          }
+          const iconStyle = table.is_enum ? 'fa-list-ul' : 'fa-table';
 
           return (
             <li
               className={isActive ? styles.activeLink : ''}
               key={'table ' + i}
             >
-              <Link to={getTableBrowseRoute(table)} data-test={tableName}>
+              <Link
+                to={getTableBrowseRoute(
+                  currentSchema,
+                  tableName,
+                  checkIfTable(table)
+                )}
+                data-test={tableName}
+              >
                 <i
-                  className={styles.tableIcon + ' fa fa-table'}
+                  className={`${styles.tableIcon} fa ${iconStyle}`}
                   aria-hidden="true"
                 />
                 {displayTableName(table)}
               </Link>
-              {gqlCompatibilityWarning}
+              <GqlCompatibilityWarning
+                identifier={tableName}
+                className={styles.add_mar_left_mid}
+              />
             </li>
           );
         });
-      } else {
-        tableLinks = [
-          <li className={styles.noChildren} key="no-tables-1">
-            <i>No tables/views available</i>
-          </li>,
-        ];
       }
 
-      const dividerHr = [
-        <li key={'fn-divider-1'}>
-          <hr className={styles.tableFunctionDivider} />
-        </li>,
-      ];
-
+      let functionLinks = [];
       if (filteredFunctionsList && filteredFunctionsList.length > 0) {
         const filteredFunctionsObject = {};
         filteredFunctionsList.forEach(f => {
@@ -152,7 +146,7 @@ class DataSubSidebar extends React.Component {
 
         const sortedFunctionNames = Object.keys(filteredFunctionsObject).sort();
 
-        const functionLinks = sortedFunctionNames.map((funcName, i) => {
+        functionLinks = sortedFunctionNames.map((funcName, i) => {
           const func = filteredFunctionsObject[funcName];
 
           const isActive =
@@ -160,7 +154,10 @@ class DataSubSidebar extends React.Component {
 
           return (
             <li className={isActive ? styles.activeLink : ''} key={'fn ' + i}>
-              <Link to={getFunctionModifyRoute(func)} data-test={funcName}>
+              <Link
+                to={getFunctionModifyRoute(getFunctionSchema(func), funcName)}
+                data-test={funcName}
+              >
                 <img
                   src={isActive ? functionSymbolActive : functionSymbol}
                   className={styles.functionIcon}
@@ -170,31 +167,29 @@ class DataSubSidebar extends React.Component {
             </li>
           );
         });
+      }
 
-        childList = [...tableLinks, ...dividerHr, ...functionLinks];
-      } else if (
-        trackedFunctions.length > 0 &&
-        filteredFunctionsList.length === 0
-      ) {
-        const noFunctionsMsg = [
-          <li className={styles.noChildren} key="no-fns-1">
-            <i>No matching functions available</i>
+      childList = [...tableLinks, ...functionLinks];
+
+      if (isEmpty(childList)) {
+        childList = [
+          <li className={styles.noChildren} key="no-tables-1">
+            <i>No tables/views/functions available</i>
           </li>,
         ];
-
-        childList = [...tableLinks, ...dividerHr, ...noFunctionsMsg];
-      } else {
-        childList = [...tableLinks];
       }
 
       return childList;
     };
 
+    const tablesViewsFunctionsCount =
+      filteredTableList.length + filteredFunctionsList.length;
+
     return (
       <LeftSubSidebar
         showAddBtn={migrationMode}
         searchInput={getSearchInput()}
-        heading={`Tables (${trackedTablesInSchema.length})`}
+        heading={`Tables/Views/Functions (${tablesViewsFunctionsCount})`}
         addLink={getSchemaAddTableRoute(currentSchema)}
         addLabel={'Add Table'}
         addTestString={'sidebar-add-table'}

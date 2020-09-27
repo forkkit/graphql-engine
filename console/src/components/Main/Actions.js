@@ -1,8 +1,10 @@
 import defaultState from './State';
+import globals from '../../Globals';
 import requestAction from '../../utils/requestAction';
 import requestActionPlain from '../../utils/requestActionPlain';
 import Endpoints, { globalCookiePolicy } from '../../Endpoints';
 import { getFeaturesCompatibility } from '../../helpers/versionUtils';
+import { getRunSqlQuery } from '../Common/utils/v1QueryUtils';
 
 const SET_MIGRATION_STATUS_SUCCESS = 'Main/SET_MIGRATION_STATUS_SUCCESS';
 const SET_MIGRATION_STATUS_ERROR = 'Main/SET_MIGRATION_STATUS_ERROR';
@@ -21,6 +23,14 @@ const EXPORT_METADATA_ERROR = 'Main/EXPORT_METADATA_ERROR';
 const UPDATE_ADMIN_SECRET_INPUT = 'Main/UPDATE_ADMIN_SECRET_INPUT';
 const LOGIN_IN_PROGRESS = 'Main/LOGIN_IN_PROGRESS';
 const LOGIN_ERROR = 'Main/LOGIN_ERROR';
+const POSTGRES_VERSION_SUCCESS = 'Main/POSTGRES_VERSION_SUCCESS';
+const POSTGRES_VERSION_ERROR = 'Main/POSTGRES_VERSION_ERROR';
+
+const RUN_TIME_ERROR = 'Main/RUN_TIME_ERROR';
+const registerRunTimeError = data => ({
+  type: RUN_TIME_ERROR,
+  data,
+});
 
 /* Server config constants*/
 const FETCHING_SERVER_CONFIG = 'Main/FETCHING_SERVER_CONFIG';
@@ -32,6 +42,41 @@ const setFeaturesCompatibility = data => ({
   type: SET_FEATURES_COMPATIBILITY,
   data,
 });
+
+const PRO_CLICKED = 'Main/PRO_CLICKED';
+const emitProClickedEvent = data => ({
+  type: PRO_CLICKED,
+  data,
+});
+
+const SET_READ_ONLY_MODE = 'Main/SET_READ_ONLY_MODE';
+const setReadOnlyMode = data => ({
+  type: SET_READ_ONLY_MODE,
+  data,
+});
+
+export const fetchPostgresVersion = (dispatch, getState) => {
+  const req = getRunSqlQuery('SELECT version()');
+  const options = {
+    method: 'POST',
+    credentials: globalCookiePolicy,
+    body: JSON.stringify(req),
+    headers: getState().tables.dataHeaders,
+  };
+
+  return dispatch(requestAction(Endpoints.query, options)).then(
+    ({ result }) => {
+      if (result.length > 1 && result[1].length) {
+        const matchRes = result[1][0].match(/[0-9]{1,}(\.[0-9]{1,})?/);
+        if (matchRes.length) {
+          dispatch({ type: POSTGRES_VERSION_SUCCESS, payload: matchRes[0] });
+          return;
+        }
+      }
+      dispatch({ type: POSTGRES_VERSION_ERROR });
+    }
+  );
+};
 
 const featureCompatibilityInit = () => {
   return (dispatch, getState) => {
@@ -91,7 +136,7 @@ const loadServerVersion = () => dispatch => {
   );
 };
 
-const fetchServerConfig = () => (dispatch, getState) => {
+const fetchServerConfig = (dispatch, getState) => {
   const url = Endpoints.serverConfig;
   const options = {
     method: 'GET',
@@ -103,16 +148,19 @@ const fetchServerConfig = () => (dispatch, getState) => {
   });
   return dispatch(requestAction(url, options)).then(
     data => {
-      return dispatch({
+      dispatch({
         type: SERVER_CONFIG_FETCH_SUCCESS,
         data: data,
       });
+      globals.serverConfig = data;
+      return Promise.resolve();
     },
     error => {
-      return dispatch({
+      dispatch({
         type: SERVER_CONFIG_FETCH_FAIL,
         data: error,
       });
+      return Promise.reject();
     }
   );
 };
@@ -129,12 +177,10 @@ const loadLatestServerVersion = () => (dispatch, getState) => {
   };
   return dispatch(requestActionPlain(url, options)).then(
     data => {
-      let parsedVersion;
       try {
-        parsedVersion = JSON.parse(data);
         dispatch({
           type: SET_LATEST_SERVER_VERSION_SUCCESS,
-          data: parsedVersion.latest,
+          data: JSON.parse(data),
         });
       } catch (e) {
         console.error(e);
@@ -212,12 +258,13 @@ const mainReducer = (state = defaultState, action) => {
     case SET_LATEST_SERVER_VERSION_SUCCESS:
       return {
         ...state,
-        latestServerVersion: action.data,
+        latestStableServerVersion: action.data.latest,
+        latestPreReleaseServerVersion: action.data.prerelease,
       };
     case SET_LATEST_SERVER_VERSION_ERROR:
       return {
         ...state,
-        latestServerVersion: null,
+        latestStableServerVersion: null,
       };
     case UPDATE_MIGRATION_STATUS_SUCCESS:
       return {
@@ -245,6 +292,12 @@ const mainReducer = (state = defaultState, action) => {
       };
     case UPDATE_MIGRATION_STATUS_ERROR:
       return { ...state, migrationError: action.data };
+    case SET_READ_ONLY_MODE:
+      return {
+        ...state,
+        readOnlyMode: action.data,
+        migrationMode: !action.data, // HACK
+      };
     case HASURACTL_URL_ENV:
       return { ...state, hasuractlEnv: action.data };
     case UPDATE_MIGRATION_MODE:
@@ -256,6 +309,8 @@ const mainReducer = (state = defaultState, action) => {
       return { ...state, loginInProgress: action.data };
     case LOGIN_ERROR:
       return { ...state, loginError: action.data };
+    case RUN_TIME_ERROR: // To trigger telemetry event
+      return state;
     case FETCHING_SERVER_CONFIG:
       return {
         ...state,
@@ -289,6 +344,16 @@ const mainReducer = (state = defaultState, action) => {
         ...state,
         featuresCompatibility: { ...action.data },
       };
+    case POSTGRES_VERSION_SUCCESS:
+      return {
+        ...state,
+        postgresVersion: action.payload,
+      };
+    case POSTGRES_VERSION_ERROR:
+      return {
+        ...state,
+        postgresVersion: null,
+      };
     default:
       return state;
   }
@@ -301,11 +366,15 @@ export {
   UPDATE_MIGRATION_STATUS_ERROR,
   UPDATE_ADMIN_SECRET_INPUT,
   loadMigrationStatus,
+  setReadOnlyMode,
   updateMigrationModeStatus,
   LOGIN_IN_PROGRESS,
   LOGIN_ERROR,
+  emitProClickedEvent,
   loadServerVersion,
   fetchServerConfig,
   loadLatestServerVersion,
   featureCompatibilityInit,
+  RUN_TIME_ERROR,
+  registerRunTimeError,
 };

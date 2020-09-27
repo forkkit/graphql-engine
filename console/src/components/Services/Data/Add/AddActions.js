@@ -9,8 +9,10 @@ import {
 import { UPDATE_MIGRATION_STATUS_ERROR } from '../../../Main/Actions';
 import { setTable } from '../DataActions.js';
 
-import { isPostgresFunction } from '../utils';
+import { isColTypeString, isPostgresFunction } from '../utils';
 import { sqlEscapeText } from '../../../Common/utils/sqlUtils';
+import { getRunSqlQuery } from '../../../Common/utils/v1QueryUtils';
+import { getTableModifyRoute } from '../../../Common/utils/routesUtils';
 
 const SET_DEFAULTS = 'AddTable/SET_DEFAULTS';
 const SET_TABLENAME = 'AddTable/SET_TABLENAME';
@@ -34,11 +36,20 @@ const REQUEST_SUCCESS = 'AddTable/REQUEST_SUCCESS';
 const REQUEST_ERROR = 'AddTable/REQUEST_ERROR';
 const VALIDATION_ERROR = 'AddTable/VALIDATION_ERROR';
 const RESET_VALIDATION_ERROR = 'AddTable/RESET_VALIDATION_ERROR';
-
+const SET_CHECK_CONSTRAINTS = 'AddTable/SET_CHECK_CONSTRAINTS';
+const REMOVE_CHECK_CONSTRAINT = 'AddTable/REMOVE_CHECK_CONSTRAINT';
 /*
  * For any action dispatched, the ability to notify the renderer that something is happening
  * */
 
+const setCheckConstraints = constraints => ({
+  type: SET_CHECK_CONSTRAINTS,
+  constraints,
+});
+const removeCheckConstraint = index => ({
+  type: REMOVE_CHECK_CONSTRAINT,
+  index,
+});
 const setDefaults = () => ({ type: SET_DEFAULTS });
 const setTableName = value => ({ type: SET_TABLENAME, value });
 const setTableComment = value => ({ type: SET_TABLECOMMENT, value });
@@ -144,19 +155,24 @@ const createTableSql = () => {
     const state = getState().addTable.table;
     const currentSchema = getState().tables.currentSchema;
 
-    const { foreignKeys, uniqueKeys } = state;
-    const tableName = state.tableName.trim();
+    const {
+      foreignKeys,
+      uniqueKeys,
+      checkConstraints,
+      tableName,
+      columns,
+    } = state;
 
     // validations
     if (tableName === '') {
       alert('Table name cannot be empty');
     }
 
-    const currentCols = state.columns.filter(c => c.name !== '');
+    const currentCols = columns.filter(c => c.name !== '');
 
     const pKeys = state.primaryKeys
       .filter(p => p !== '')
-      .map(p => state.columns[p].name);
+      .map(p => currentCols[p].name);
 
     let hasUUIDDefault = false;
     const columnSpecificSql = [];
@@ -177,7 +193,7 @@ const createTableSql = () => {
         currentCols[i].default.value !== ''
       ) {
         if (
-          currentCols[i].type === 'text' &&
+          isColTypeString(currentCols[i].type) &&
           !isPostgresFunction(currentCols[i].default.value)
         ) {
           // if a column type is text and if it has a non-func default value, add a single quote by default
@@ -270,6 +286,17 @@ const createTableSql = () => {
       });
     }
 
+    // add check constraints
+    if (checkConstraints.length > 0) {
+      checkConstraints.forEach(constraint => {
+        if (!constraint.name || !constraint.check) {
+          return;
+        }
+
+        tableDefSql += `, CONSTRAINT "${constraint.name}" CHECK (${constraint.check})`;
+      });
+    }
+
     let sqlCreateTable =
       'CREATE TABLE ' +
       '"' +
@@ -314,16 +341,10 @@ const createTableSql = () => {
     if (hasUUIDDefault) {
       const sqlCreateExtension = 'CREATE EXTENSION IF NOT EXISTS pgcrypto;';
 
-      upQueryArgs.push({
-        type: 'run_sql',
-        args: { sql: sqlCreateExtension },
-      });
+      upQueryArgs.push(getRunSqlQuery(sqlCreateExtension));
     }
 
-    upQueryArgs.push({
-      type: 'run_sql',
-      args: { sql: sqlCreateTable },
-    });
+    upQueryArgs.push(getRunSqlQuery(sqlCreateTable));
 
     upQueryArgs.push({
       type: 'add_existing_table_or_view',
@@ -344,12 +365,7 @@ const createTableSql = () => {
 
     const downQuery = {
       type: 'bulk',
-      args: [
-        {
-          type: 'run_sql',
-          args: { sql: sqlDropTable },
-        },
-      ],
+      args: [getRunSqlQuery(sqlDropTable)],
     };
 
     // make request
@@ -362,9 +378,7 @@ const createTableSql = () => {
       dispatch({ type: SET_DEFAULTS });
       dispatch(setTable(tableName));
       dispatch(updateSchemaInfo()).then(() =>
-        dispatch(
-          _push('/schema/' + currentSchema + '/tables/' + tableName + '/modify')
-        )
+        dispatch(_push(getTableModifyRoute(currentSchema, tableName, true)))
       );
       return;
     };
@@ -554,6 +568,18 @@ const addTableReducerCore = (state = defaultState, action) => {
         ...state,
         columns: action.columns,
       };
+    case SET_CHECK_CONSTRAINTS:
+      return {
+        ...state,
+        checkConstraints: action.constraints,
+      };
+    case REMOVE_CHECK_CONSTRAINT:
+      return {
+        ...state,
+        checkConstraints: state.checkConstraints.filter(
+          (_, idx) => idx !== action.index
+        ),
+      };
     default:
       return state;
   }
@@ -607,5 +633,7 @@ export {
   toggleFk,
   clearFkToggle,
   setFreqUsedColumn,
+  setCheckConstraints,
+  removeCheckConstraint,
 };
 export { resetValidation, validationError };
